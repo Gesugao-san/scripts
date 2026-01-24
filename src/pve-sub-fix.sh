@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# How to run me:
+# cd ~/pve-fake-subscription/
+# curl -LJO https://raw.githubusercontent.com/Gesugao-san/chocolatey-scripts/refs/heads/master/src/pve-sub-fix.sh
+# chmod +x pve-sub-fix.sh
+# ./pve-sub-fix.sh
+
 echo "[*] Starting pve-fake-subscription setup script"
 
 # ---- Safety check ----
