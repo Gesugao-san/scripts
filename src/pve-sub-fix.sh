@@ -83,6 +83,7 @@ else
   echo "[+] Entry added to /etc/hosts"
 fi
 
-systemctl restart pveproxy.service
-
 echo "[✓] Script finished successfully"
+echo "[*] Restarting PVE Proxy Service, reload page manually in a few seconds"
+
+systemctl restart pveproxy.service
