@@ -43,7 +43,7 @@ echo "[+] sha256sum.txt downloaded"
 
 # ---- Extract .deb filename ----
 echo "[*] Extracting .deb filename from sha256sum.txt"
-DEB_FILE="$(awk '{print $2}' sha256sum.txt | grep '\.deb$' | head -n1)"
+DEB_FILE="$(awk '{print $2}' sha256sum.txt | sed 's/^\*//' | grep '\.deb$' | head -n1)"
 
 if [ -z "$DEB_FILE" ]; then
   echo "[!] ERROR: .deb file name not found in sha256sum.txt"
