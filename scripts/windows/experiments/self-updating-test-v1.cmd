@@ -4,7 +4,7 @@ setlocal EnableDelayedExpansion
 set "SCRIPT_NAME=%~nx0"
 set "SCRIPT_PATH=%~f0"
 set "TEMP_DIR=%TEMP%\self_update"
-set "REPO_URL=https://raw.githubusercontent.com/Gesugao-san/chocolatey-scripts/refs/heads/master/src/self_updating_test.bat"
+set "REPO_URL=https://raw.githubusercontent.com/Gesugao-san/chocolatey-scripts/refs/heads/master/scripts/windows/experiments/self-updating-test-v1.cmd"
 
 :: Create temporary directory
 if not exist "%TEMP_DIR%" mkdir "%TEMP_DIR%"
@@ -114,10 +114,10 @@ if !errorlevel! equ 0 (
     :: Compare hashes of current and remote script
     call :calculate_self_hash CURRENT_HASH
     call :calculate_file_hash "!TEMP_DIR!\remote_script.bat" REMOTE_HASH
-    
+
     echo Current hash: !CURRENT_HASH!
     echo Remote hash: !REMOTE_HASH!
-    
+
     if "!CURRENT_HASH!" neq "!REMOTE_HASH!" (
       echo.
       echo ========================================
@@ -130,7 +130,7 @@ if !errorlevel! equ 0 (
     ) else (
       echo Script is up to date.
     )
-    
+
     del "!TEMP_DIR!\remote_script.bat" >nul 2>&1
   )
 ) else (
