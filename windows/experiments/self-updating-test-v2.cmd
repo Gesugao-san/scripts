@@ -1,7 +1,7 @@
 ECHO OFF
 SETLOCAL ENABLEDELAYEDEXPANSION
 
-SET "SCRIPT_URL=https://raw.githubusercontent.com/Gesugao-san/scripts/refs/heads/master/scripts/windows/experiments/self-updating-test-v2.cmd"
+SET "SCRIPT_URL=https://raw.githubusercontent.com/Gesugao-san/scripts/refs/heads/master/windows/experiments/self-updating-test-v2.cmd"
 SET "SCRIPT_PATH=%~f0"
 SET "TEMP_FILE=%TEMP%\update_%random%.cmd"
 
