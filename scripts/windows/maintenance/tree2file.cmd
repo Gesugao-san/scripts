@@ -7,4 +7,3 @@ FOR /F %%D IN ('powershell -Command "Get-Date -Format 'yyyy-MM-dd_HH-mm'"') DO S
 TREE /F /A > "%FOLDER%_%DATE%_tree.txt"
 ECHO Tree saved to: "%FOLDER%_%DATE%_tree.log"
 PAUSE
-  

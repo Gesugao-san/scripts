@@ -3,7 +3,7 @@ set -euo pipefail
 
 # How to run me:
 # cd ~/pve-fake-subscription/
-# curl -LJO https://raw.githubusercontent.com/Gesugao-san/chocolatey-scripts/refs/heads/master/src/pve-sub-fix.sh
+# curl -LJO https://raw.githubusercontent.com/Gesugao-san/scripts/refs/heads/master/scripts/linux/pve-sub-fix.sh
 # chmod +x pve-sub-fix.sh
 # ./pve-sub-fix.sh
 
