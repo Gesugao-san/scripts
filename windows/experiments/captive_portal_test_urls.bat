@@ -106,7 +106,8 @@ set urls[50]=http://api.browser.yandex.ru/generate_204
 
 echo Checking the following endpoints:
 echo.
-for /l %%i in (0,1,10) do (
+:: Loop through all possible indices (0 to 50)
+for /l %%i in (0,1,50) do (
     if defined urls[%%i] (
         echo   [!urls[%%i]!]
     )
@@ -115,7 +116,8 @@ echo.
 echo ===================================================
 echo.
 
-for /l %%i in (0,1,10) do (
+:: Loop through all possible indices (0 to 50)
+for /l %%i in (0,1,50) do (
     if defined urls[%%i] (
         set "current_url=!urls[%%i]!"
         
