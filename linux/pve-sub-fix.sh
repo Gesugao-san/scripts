@@ -24,7 +24,9 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 # ---- Config ----
-BASE_DIR="$HOME/pve-fake-subscription"
+# PVE web shell may start without $HOME, which breaks "set -u"
+HOME_DIR="${HOME:-$(getent passwd "$(id -un)" | cut -d: -f6)}"
+BASE_DIR="$HOME_DIR/pve-fake-subscription"
 REPO="Jamesits/pve-fake-subscription"
 HOSTS_ENTRY="127.0.0.1 shop.maurer-it.com"
 
