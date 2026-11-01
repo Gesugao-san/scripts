@@ -172,14 +172,18 @@ pick_storage() {
     | awk 'NR == 1 { print $2 }'
 }
 
-# @description Print the newest standard Debian template available.
+# @description Print the newest standard Debian template available for the
+#   host architecture. PVE 9 also lists arm64 templates, and "arm64" sorts
+#   after "amd64", so the architecture filter is required.
 # @stdout Template file name.
 latest_template() {
+  local arch
+  arch="$(dpkg --print-architecture)"
   pveam update > /dev/null 2>&1 \
     || warn "pveam update failed, using the cached list"
   pveam available --section system \
     | awk '{ print $2 }' \
-    | { grep -E "^debian-${CT_DEBIAN}-standard_" || true; } \
+    | { grep -E "^debian-${CT_DEBIAN}-standard_.*_${arch}\.tar\." || true; } \
     | sort -V \
     | tail -n 1
 }
@@ -204,10 +208,13 @@ ct_exec() {
 }
 
 # @description Start the container unless it is already running.
+# @exitcode 1 The container does not run after the start attempt.
 ensure_running() {
   pct status "$CT_ID" | grep -q 'running' && return 0
   log "Starting container $CT_ID"
-  pct start "$CT_ID"
+  pct start "$CT_ID" || true
+  pct status "$CT_ID" | grep -q 'running' && return 0
+  die "CT $CT_ID does not start, see: pct start $CT_ID --debug"
 }
 
 # @description Wait until the container resolves names and reaches GitHub.
@@ -473,6 +480,8 @@ action_install() {
   [[ -z "$EXISTING_ID" ]] || die "CT $EXISTING_ID ($CT_HOSTNAME) already exists"
   check_network_settings
   create_ct
+  # "pct create --start 1" succeeds even when the start itself fails.
+  ensure_running
   set_root_password
   wait_for_network
   upgrade_os
