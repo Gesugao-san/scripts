@@ -12,6 +12,8 @@
 #   * Container already exists: snapshots it, upgrades Debian packages and
 #     re-runs the official installer, which replaces the binaries and keeps
 #     the panel settings, database, inbounds and clients.
+#   * Both cases: turns on the Xray-native Geodata Auto-Update with the
+#     panel's standard sources, unless it is already configured.
 #
 #   How to run:
 #     bash <(curl -fsSL https://raw.githubusercontent.com/Gesugao-san/scripts/master/linux/pve-3x-ui.sh)
@@ -40,6 +42,9 @@ CT_IP="${CT_IP:-dhcp}"
 CT_GW="${CT_GW:-}"
 KEEP_SNAPSHOTS="${KEEP_SNAPSHOTS:-3}"
 FORCE="${FORCE:-0}"
+GEODATA="${GEODATA:-1}"
+GEODATA_CRON="${GEODATA_CRON:-0 4 * * *}"
+GEODATA_FORCE="${GEODATA_FORCE:-0}"
 XUI_VERSION="${XUI_VERSION:-}"
 XUI_INSTALLER_URL="${XUI_INSTALLER_URL:-https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh}"
 
@@ -108,6 +113,9 @@ Environment (all optional):
   CT_GW                gateway, required with a static CT_IP
   KEEP_SNAPSHOTS       update snapshots to keep                     [3]
   FORCE                1 = reinstall 3x-ui even if it is up to date [0]
+  GEODATA              1 = set up Geodata Auto-Update, 0 = skip     [1]
+  GEODATA_CRON         schedule of the geodata download    [0 4 * * *]
+  GEODATA_FORCE        1 = replace an existing geodata setup        [0]
   XUI_VERSION          3x-ui release tag, e.g. v3.7.0          [latest]
   XUI_*                any other XUI_* variable goes to the official
                        installer (XUI_PANEL_PORT, XUI_USERNAME, ...)
@@ -334,7 +342,7 @@ upgrade_os() {
     -o Dpkg::Options::=--force-confdef \
     -o Dpkg::Options::=--force-confold \
     full-upgrade
-  ct_exec apt-get -y -q install curl ca-certificates openssl
+  ct_exec apt-get -y -q install curl ca-certificates openssl jq
   ct_exec apt-get -y -q autoremove
   ok "Debian packages are up to date"
 }
@@ -417,6 +425,96 @@ update_xui_if_needed() {
   ok "3x-ui $current is already the target version, nothing to update"
 }
 
+# @description Print the script that sets up Geodata Auto-Update inside the
+#   container. It talks to the panel API on 127.0.0.1 the same way the
+#   panel's "Use standard sources" + "Save & Restart Xray" buttons do, so
+#   the source list always matches the installed panel version.
+#   Expects GEODATA_CRON and GEODATA_FORCE in the environment.
+# @stdout Bash script.
+geodata_script() {
+  cat << 'EOF'
+set -euo pipefail
+xui=/usr/local/x-ui/x-ui
+bin_dir=/usr/local/x-ui/bin
+
+# Reads one "key: value" line from the x-ui CLI output.
+field() { grep -Eo "$1: .+" | head -n 1 | awk '{ print $2 }'; }
+
+settings="$("$xui" setting -show true)"
+port="$(field port <<< "$settings")"
+path="$(field webBasePath <<< "$settings")"
+path="${path#/}"
+path="${path%/}"
+cert="$("$xui" setting -getCert true | field cert || true)"
+scheme=http
+[[ -z "$cert" ]] || scheme=https
+base="$scheme://127.0.0.1:$port/${path:+$path/}panel/api"
+
+# A dedicated token: -getApiToken regenerates it on every run, so tokens do
+# not pile up and the installer's own token stays untouched.
+token="$("$xui" setting -getApiToken -tokenName pve-3x-ui -tokenScope admin \
+  | field apiToken)"
+[[ -n "$token" ]] || { echo "[!] no API token from x-ui"; exit 1; }
+
+api() {
+  curl -fsSk --retry 3 -H "Authorization: Bearer $token" -X POST "$@"
+}
+
+response="$(api "$base/xray/")"
+jq -e '.success' <<< "$response" > /dev/null \
+  || { echo "[!] the panel did not return Xray settings"; exit 1; }
+payload="$(jq -r '.obj' <<< "$response")"
+
+if [[ "$GEODATA_FORCE" != "1" ]] \
+  && jq -e '(.xraySetting.geodata.assets // []) | length > 0' \
+    <<< "$payload" > /dev/null; then
+  echo "[=] Geodata Auto-Update is already configured, keeping it"
+  exit 0
+fi
+
+# Xray only refreshes files that already exist, so fetch missing ones once.
+missing=0
+for file in $(jq -r '.geodataSources[].file' <<< "$payload"); do
+  [[ -f "$bin_dir/$file" ]] || missing=1
+done
+if [[ "$missing" == "1" ]]; then
+  echo "[*] Downloading missing geo files"
+  api "$base/server/updateGeofile" > /dev/null
+fi
+
+setting="$(jq --arg cron "$GEODATA_CRON" '
+  . as $p
+  | $p.xraySetting
+  | .geodata = (
+      { assets: $p.geodataSources }
+      + (if $cron != "" then { cron: $cron } else {} end)
+      + (if $p.xraySetting.geodata.outbound
+           then { outbound: $p.xraySetting.geodata.outbound } else {} end)
+    )' <<< "$payload")"
+test_url="$(jq -r '.outboundTestUrl // ""' <<< "$payload")"
+
+result="$(api "$base/xray/update" \
+  --data-urlencode "xraySetting=$setting" \
+  --data-urlencode "outboundTestUrl=$test_url")"
+if ! jq -e '.success' <<< "$result" > /dev/null; then
+  echo "[!] the panel rejected the setting: $(jq -r '.msg' <<< "$result")"
+  exit 1
+fi
+count="$(jq -r '.geodataSources | length' <<< "$payload")"
+echo "[+] Geodata Auto-Update: $count files, cron '$GEODATA_CRON'"
+EOF
+}
+
+# @description Turn on Geodata Auto-Update in the panel. Never fatal: the
+#   panel works without it and it can be set by hand later.
+configure_geodata() {
+  [[ "$GEODATA" == "1" ]] || return 0
+  log "Configuring Xray Geodata Auto-Update"
+  ct_exec env "GEODATA_CRON=$GEODATA_CRON" "GEODATA_FORCE=$GEODATA_FORCE" \
+    bash -s < <(geodata_script) && return 0
+  warn "Geodata Auto-Update was not configured, set it in the panel"
+}
+
 # ---- State on the host ----
 
 # @description Save a secret under the container's state folder.
@@ -486,6 +584,7 @@ action_install() {
   wait_for_network
   upgrade_os
   install_xui
+  configure_geodata
   save_panel_credentials
 }
 
@@ -499,6 +598,7 @@ action_update() {
   wait_for_network
   upgrade_os
   update_xui_if_needed
+  configure_geodata
   save_panel_credentials
 }
 
