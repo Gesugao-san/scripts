@@ -2,8 +2,8 @@
 set -euo pipefail
 
 # How to run me:
-# cd ~/pve-fake-subscription/
-# curl -LJO https://raw.githubusercontent.com/Gesugao-san/scripts/refs/heads/master/scripts/linux/pve-sub-fix.sh
+# mkdir -p ~/pve-fake-subscription/ && cd ~/pve-fake-subscription/
+# curl -LJO https://raw.githubusercontent.com/Gesugao-san/scripts/refs/heads/master/linux/pve-sub-fix.sh
 # chmod +x pve-sub-fix.sh
 # ./pve-sub-fix.sh
 
@@ -15,6 +15,13 @@ if [ -z "${BASH_VERSION:-}" ]; then
   exit 1
 fi
 echo "[+] Running under bash ${BASH_VERSION}"
+
+# ---- Privileges ----
+# PVE ships without sudo and is usually administered as root
+SUDO=""
+if [ "$(id -u)" -ne 0 ]; then
+  SUDO="sudo"
+fi
 
 # ---- Config ----
 BASE_DIR="$HOME/pve-fake-subscription"
@@ -70,7 +77,7 @@ echo "[+] Checksum verification passed"
 
 # ---- Install package ----
 echo "[*] Installing package via dpkg"
-sudo dpkg -i "$DEB_FILE"
+$SUDO dpkg -i "$DEB_FILE"
 echo "[+] Package installed"
 
 # ---- Update /etc/hosts ----
@@ -79,11 +86,11 @@ if grep -qF "$HOSTS_ENTRY" /etc/hosts; then
   echo "[=] /etc/hosts already contains required entry"
 else
   echo "[*] Adding entry to /etc/hosts"
-  echo "$HOSTS_ENTRY" | sudo tee -a /etc/hosts > /dev/null
+  echo "$HOSTS_ENTRY" | $SUDO tee -a /etc/hosts > /dev/null
   echo "[+] Entry added to /etc/hosts"
 fi
 
 echo "[✓] Script finished successfully"
 echo "[*] Restarting PVE Proxy Service, reload page manually in a few seconds"
 
-systemctl restart pveproxy.service
+$SUDO systemctl restart pveproxy.service
