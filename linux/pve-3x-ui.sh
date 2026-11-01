@@ -19,7 +19,8 @@
 #   With settings (all optional, see --help):
 #     CT_IP=192.168.11.50/24 CT_GW=192.168.11.1 bash pve-3x-ui.sh
 #
-#   Secrets are never printed. They are saved under $STATE_DIR (mode 600).
+#   Secrets are masked in the output and the log (mode 600). They are saved
+#   under $STATE_DIR (mode 600).
 
 set -euo pipefail
 
@@ -38,6 +39,7 @@ CT_BRIDGE="${CT_BRIDGE:-vmbr0}"
 CT_IP="${CT_IP:-dhcp}"
 CT_GW="${CT_GW:-}"
 KEEP_SNAPSHOTS="${KEEP_SNAPSHOTS:-3}"
+FORCE="${FORCE:-0}"
 XUI_VERSION="${XUI_VERSION:-}"
 XUI_INSTALLER_URL="${XUI_INSTALLER_URL:-https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh}"
 
@@ -105,6 +107,7 @@ Environment (all optional):
   CT_IP                "dhcp" or CIDR, e.g. 192.168.11.50/24     [dhcp]
   CT_GW                gateway, required with a static CT_IP
   KEEP_SNAPSHOTS       update snapshots to keep                     [3]
+  FORCE                1 = reinstall 3x-ui even if it is up to date [0]
   XUI_VERSION          3x-ui release tag, e.g. v3.7.0          [latest]
   XUI_*                any other XUI_* variable goes to the official
                        installer (XUI_PANEL_PORT, XUI_USERNAME, ...)
@@ -172,7 +175,8 @@ pick_storage() {
 # @description Print the newest standard Debian template available.
 # @stdout Template file name.
 latest_template() {
-  pveam update > /dev/null
+  pveam update > /dev/null 2>&1 \
+    || warn "pveam update failed, using the cached list"
   pveam available --section system \
     | awk '{ print $2 }' \
     | { grep -E "^debian-${CT_DEBIAN}-standard_" || true; } \
@@ -353,11 +357,57 @@ install_xui() {
   log "Running the official 3x-ui installer ${XUI_VERSION:-(latest)}"
   ct_exec curl -fsSL --retry 3 -o /root/xui-install.sh "$XUI_INSTALLER_URL"
   ct_exec env "${env_args[@]}" bash /root/xui-install.sh \
-    ${XUI_VERSION:+"$XUI_VERSION"} < /dev/null
+    ${XUI_VERSION:+"$XUI_VERSION"} < /dev/null | mask_secrets
   ct_exec rm -f /root/xui-install.sh
 
   ct_exec systemctl is-active --quiet x-ui || die "x-ui is not running"
   ok "3x-ui is installed and running"
+}
+
+# @description Hide credentials that the official installer prints, so they
+#   reach neither the terminal nor the log. They are kept in
+#   /etc/x-ui/install-result.env and copied to $STATE_DIR instead.
+# @stdin Installer output.
+# @stdout The same output with secret values replaced by ***.
+mask_secrets() {
+  local keys='Username|Password|API Token|WebBasePath|Access URL'
+  sed -u -E "s/((${keys})[^:]*:[[:space:]]*).*/\1***\x1b[0m/"
+}
+
+# @description Print the latest 3x-ui release tag, empty when unknown.
+#   Uses the release redirect, which has no API rate limit.
+# @stdout Tag such as v3.7.0.
+latest_xui_tag() {
+  local url
+  url="$(curl -fsSLI -o /dev/null -w '%{url_effective}' --retry 3 \
+    --max-time 30 https://github.com/MHSanaei/3x-ui/releases/latest \
+    2> /dev/null || true)"
+  [[ "$url" == */tag/* ]] || return 0
+  printf '%s' "${url##*/tag/}"
+}
+
+# @description Print the installed 3x-ui version, empty when unknown.
+# @stdout Version such as 3.7.0.
+installed_xui_version() {
+  ct_exec /usr/local/x-ui/x-ui -v 2> /dev/null || true
+}
+
+# @description Install 3x-ui unless the target version is already there.
+#   FORCE=1 reinstalls anyway.
+update_xui_if_needed() {
+  local current target
+  current="$(installed_xui_version)"
+  target="${XUI_VERSION:-$(latest_xui_tag)}"
+  if [[ "$FORCE" == "1" || -z "$current" || -z "$target" ]]; then
+    install_xui
+    return 0
+  fi
+  if [[ "${current#v}" != "${target#v}" ]]; then
+    log "3x-ui $current -> $target"
+    install_xui
+    return 0
+  fi
+  ok "3x-ui $current is already the target version, nothing to update"
 }
 
 # ---- State on the host ----
@@ -439,7 +489,7 @@ action_update() {
   ensure_running
   wait_for_network
   upgrade_os
-  install_xui
+  update_xui_if_needed
   save_panel_credentials
 }
 
@@ -474,6 +524,8 @@ main() {
   require_root
   require_pve
   take_lock
+  (umask 077 && : >> "$LOG_FILE")
+  chmod 600 "$LOG_FILE"
   exec > >(tee -a "$LOG_FILE") 2>&1
   log "pve-3x-ui.sh started $(date '+%F %T'), mode $mode"
 
