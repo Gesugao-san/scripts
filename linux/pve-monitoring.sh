@@ -17,13 +17,17 @@
 #   * Alertmanager, sending to Telegram when TG_BOT_TOKEN and TG_CHAT_ID
 #     are set;
 #   * blackbox exporter, probing the 3x-ui container (Xray and the panel);
+#   * scraping of OpenWrt routers listed in OPENWRT_TARGETS (set them up
+#     with openwrt/prometheus-node-exporter.sh) plus the "OpenWrt"
+#     dashboard;
 #   * prometheus-pve-exporter from PyPI;
 #   * Grafana with provisioned data source and dashboards, including an
 #     own "PVE overview" dashboard set as the home page (skipped with a
 #     warning when its repository is unreachable).
 #
 #   Running it again updates everything: snapshot of the container, Debian
-#   packages, the PVE exporter and the generated configs.
+#   packages, the PVE exporter and the generated configs. Settings given
+#   once (routers, Telegram, ...) are remembered in $SETTINGS_FILE.
 #
 #   How to run:
 #     bash <(curl -fsSL https://raw.githubusercontent.com/Gesugao-san/scripts/master/linux/pve-monitoring.sh)
@@ -37,7 +41,35 @@
 
 set -euo pipefail
 
-# ---- Settings (environment overrides) ----
+# ---- Settings (environment > saved > default) ----
+
+# The host may be reached through the PVE web shell, which starts without
+# $HOME, so the state paths are absolute on purpose.
+STATE_DIR="/root/pve-monitoring"
+SETTINGS_FILE="$STATE_DIR/settings.env"
+
+# Settings that are remembered between runs, so an update without any
+# variables keeps the router targets, Telegram and the rest.
+PERSISTED_SETTINGS=(
+  RETENTION XUI_HOSTNAME XUI_PROBE_PORTS OPENWRT_TARGETS
+  TG_BOT_TOKEN TG_CHAT_ID GRAFANA GRAFANA_APT_URL GRAFANA_DASHBOARDS
+)
+
+# @description Load saved settings for variables that are not set in the
+#   environment. A variable set to an empty value still wins, so
+#   "TG_BOT_TOKEN= bash pve-monitoring.sh" turns Telegram off.
+load_settings() {
+  [[ -f "$SETTINGS_FILE" ]] || return 0
+  local name value
+  while IFS='=' read -r name value; do
+    [[ " ${PERSISTED_SETTINGS[*]} " == *" $name "* ]] || continue
+    [[ -z "${!name+x}" ]] || continue
+    # Values are written with printf %q by save_settings.
+    eval "$name=$value"
+  done < "$SETTINGS_FILE"
+}
+
+load_settings
 
 CT_HOSTNAME="${CT_HOSTNAME:-monitor}"
 CT_ID="${CT_ID:-}"
@@ -55,15 +87,13 @@ KEEP_SNAPSHOTS="${KEEP_SNAPSHOTS:-3}"
 RETENTION="${RETENTION:-30d}"
 XUI_HOSTNAME="${XUI_HOSTNAME:-xui}"
 XUI_PROBE_PORTS="${XUI_PROBE_PORTS:-443}"
+OPENWRT_TARGETS="${OPENWRT_TARGETS:-}"
 TG_BOT_TOKEN="${TG_BOT_TOKEN:-}"
 TG_CHAT_ID="${TG_CHAT_ID:-}"
 GRAFANA="${GRAFANA:-1}"
 GRAFANA_APT_URL="${GRAFANA_APT_URL:-https://apt.grafana.com}"
 GRAFANA_DASHBOARDS="${GRAFANA_DASHBOARDS:-1860 10347}"
 
-# The host may be reached through the PVE web shell, which starts without
-# $HOME, so the state paths are absolute on purpose.
-STATE_DIR="/root/pve-monitoring"
 LOG_FILE="/var/log/pve-monitoring.log"
 LOCK_FILE="/run/lock/pve-monitoring.lock"
 SNAPSHOT_PREFIX="mon_"
@@ -130,11 +160,17 @@ Environment (all optional):
   RETENTION            how long Prometheus keeps data             [30d]
   XUI_HOSTNAME         3x-ui container to probe, if it exists     [xui]
   XUI_PROBE_PORTS      Xray ports to probe, space separated       [443]
+  OPENWRT_TARGETS      OpenWrt exporters, "ip:port" words        [none]
+                       (see openwrt/prometheus-node-exporter.sh)
   TG_BOT_TOKEN         Telegram bot token for alerts             [none]
   TG_CHAT_ID           Telegram chat ID for alerts               [none]
   GRAFANA              1 = install Grafana, 0 = skip                [1]
   GRAFANA_APT_URL      Grafana APT repository   [https://apt.grafana.com]
   GRAFANA_DASHBOARDS   grafana.com dashboard IDs          [1860 10347]
+
+RETENTION, XUI_*, OPENWRT_TARGETS, TG_* and GRAFANA* are remembered in
+/root/pve-monitoring/settings.env, so later runs need no variables; set one
+to an empty value to clear it.
 
 Secrets are saved under /root/pve-monitoring/ (mode 600).
 Log: /var/log/pve-monitoring.log
@@ -368,6 +404,25 @@ save_secret() {
   (umask 077 && printf '%s\n' "$2" > "$STATE_DIR/$1")
 }
 
+# @description Remember the persisted settings for the next run. The file
+#   also holds TG_BOT_TOKEN, so it is created with mode 600.
+save_settings() {
+  local name
+  install -d -m 700 "$STATE_DIR"
+  # The redirection is inside the subshell, so the umask applies to it;
+  # chmod also fixes a file that already existed with wider permissions.
+  (
+    umask 077
+    {
+      printf '# Managed by pve-monitoring.sh; edit or delete to reset.\n'
+      for name in "${PERSISTED_SETTINGS[@]}"; do
+        printf '%s=%q\n' "$name" "${!name}"
+      done
+    } > "$SETTINGS_FILE"
+  )
+  chmod 600 "$SETTINGS_FILE"
+}
+
 # @description Print a saved secret, empty when missing.
 # @arg $1 string File name.
 # @stdout Content without the trailing newline.
@@ -575,6 +630,14 @@ EOF
         replacement: 127.0.0.1:9115"
   fi
 
+  local openwrt_job=""
+  if [[ -n "$OPENWRT_TARGETS" ]]; then
+    openwrt_job="
+  - job_name: openwrt
+    static_configs:
+      - targets: [$(yaml_targets "$OPENWRT_TARGETS")]"
+  fi
+
   write_file /etc/prometheus/prometheus.yml 644 root:root << EOF
 # Managed by pve-monitoring.sh, rewritten on every run.
 # Own scrape configs: /etc/prometheus/scrape.d/*.yml
@@ -624,6 +687,7 @@ scrape_configs:
       - target_label: __address__
         replacement: 127.0.0.1:9221
 ${xray_job}
+${openwrt_job}
 EOF
 
   write_file /etc/prometheus/rules/pve-monitoring.yml 644 root:root << 'EOF'
@@ -838,7 +902,14 @@ write_overview_dashboard() {
 {"id":15,"type":"timeseries","title":"CPU гостей","datasource":{"type":"prometheus","uid":"prometheus"},"gridPos":{"x":6,"y":20,"w":9,"h":8},"fieldConfig":{"defaults":{"unit":"percent","min":0},"overrides":[]},"targets":[{"datasource":{"type":"prometheus","uid":"prometheus"},"refId":"A","expr":"pve_cpu_usage_ratio{id=~\"(lxc|qemu)/.+\"} * on(id) group_left(name) pve_guest_info * 100","legendFormat":"{{name}}"}],"options":{"legend":{"displayMode":"list","placement":"bottom"},"tooltip":{"mode":"multi"}}},
 {"id":16,"type":"timeseries","title":"ОЗУ гостей","datasource":{"type":"prometheus","uid":"prometheus"},"gridPos":{"x":15,"y":20,"w":9,"h":8},"fieldConfig":{"defaults":{"unit":"bytes","min":0},"overrides":[]},"targets":[{"datasource":{"type":"prometheus","uid":"prometheus"},"refId":"A","expr":"pve_memory_usage_bytes{id=~\"(lxc|qemu)/.+\"} * on(id) group_left(name) pve_guest_info","legendFormat":"{{name}}"}],"options":{"legend":{"displayMode":"list","placement":"bottom"},"tooltip":{"mode":"multi"}}},
 {"id":17,"type":"stat","title":"Гости без бэкапа","datasource":{"type":"prometheus","uid":"prometheus"},"gridPos":{"x":0,"y":28,"w":6,"h":8},"fieldConfig":{"defaults":{"thresholds":{"mode":"absolute","steps":[{"color":"green","value":null},{"color":"orange","value":1}]},"color":{"mode":"thresholds"}},"overrides":[]},"targets":[{"datasource":{"type":"prometheus","uid":"prometheus"},"refId":"A","expr":"count(pve_not_backed_up_info) or vector(0)","legendFormat":""}],"options":{"reduceOptions":{"calcs":["lastNotNull"]},"colorMode":"background","graphMode":"none","textMode":"value"}},
-{"id":18,"type":"timeseries","title":"Дисковый ввод-вывод хоста","datasource":{"type":"prometheus","uid":"prometheus"},"gridPos":{"x":6,"y":28,"w":18,"h":8},"fieldConfig":{"defaults":{"unit":"Bps","min":0},"overrides":[]},"targets":[{"datasource":{"type":"prometheus","uid":"prometheus"},"refId":"A","expr":"rate(node_disk_read_bytes_total{job=\"pve-host\",device=~\"sd[a-z]+|nvme[0-9]+n[0-9]+\"}[$__rate_interval])","legendFormat":"{{device}} чтение"},{"datasource":{"type":"prometheus","uid":"prometheus"},"refId":"B","expr":"rate(node_disk_written_bytes_total{job=\"pve-host\",device=~\"sd[a-z]+|nvme[0-9]+n[0-9]+\"}[$__rate_interval])","legendFormat":"{{device}} запись"}],"options":{"legend":{"displayMode":"list","placement":"bottom"},"tooltip":{"mode":"multi"}}}
+{"id":18,"type":"timeseries","title":"Дисковый ввод-вывод хоста","datasource":{"type":"prometheus","uid":"prometheus"},"gridPos":{"x":6,"y":28,"w":18,"h":8},"fieldConfig":{"defaults":{"unit":"Bps","min":0},"overrides":[]},"targets":[{"datasource":{"type":"prometheus","uid":"prometheus"},"refId":"A","expr":"rate(node_disk_read_bytes_total{job=\"pve-host\",device=~\"sd[a-z]+|nvme[0-9]+n[0-9]+\"}[$__rate_interval])","legendFormat":"{{device}} чтение"},{"datasource":{"type":"prometheus","uid":"prometheus"},"refId":"B","expr":"rate(node_disk_written_bytes_total{job=\"pve-host\",device=~\"sd[a-z]+|nvme[0-9]+n[0-9]+\"}[$__rate_interval])","legendFormat":"{{device}} запись"}],"options":{"legend":{"displayMode":"list","placement":"bottom"},"tooltip":{"mode":"multi"}}},
+{"id":19,"type":"stat","title":"Роутер","datasource":{"type":"prometheus","uid":"prometheus"},"gridPos":{"x":0,"y":36,"w":4,"h":4},"fieldConfig":{"defaults":{"thresholds":{"mode":"absolute","steps":[{"color":"red","value":null},{"color":"green","value":1}]},"color":{"mode":"thresholds"},"mappings":[{"type":"value","options":{"1":{"text":"UP","color":"green","index":0},"0":{"text":"DOWN","color":"red","index":1}}}]},"overrides":[]},"targets":[{"datasource":{"type":"prometheus","uid":"prometheus"},"refId":"A","expr":"up{job=\"openwrt\"}","legendFormat":"{{instance}}"}],"options":{"reduceOptions":{"calcs":["lastNotNull"]},"colorMode":"background","graphMode":"none","textMode":"value_and_name"}},
+{"id":20,"type":"stat","title":"Аптайм роутера","datasource":{"type":"prometheus","uid":"prometheus"},"gridPos":{"x":4,"y":36,"w":4,"h":4},"fieldConfig":{"defaults":{"unit":"s","decimals":0,"thresholds":{"mode":"absolute","steps":[{"color":"blue","value":null}]},"color":{"mode":"thresholds"}},"overrides":[]},"targets":[{"datasource":{"type":"prometheus","uid":"prometheus"},"refId":"A","expr":"time() - node_boot_time_seconds{job=\"openwrt\"}","legendFormat":"{{instance}}"}],"options":{"reduceOptions":{"calcs":["lastNotNull"]},"colorMode":"background","graphMode":"none","textMode":"value"}},
+{"id":21,"type":"stat","title":"Нагрузка роутера (1 мин)","datasource":{"type":"prometheus","uid":"prometheus"},"gridPos":{"x":8,"y":36,"w":4,"h":4},"fieldConfig":{"defaults":{"decimals":2,"thresholds":{"mode":"absolute","steps":[{"color":"green","value":null},{"color":"orange","value":2},{"color":"red","value":4}]},"color":{"mode":"thresholds"}},"overrides":[]},"targets":[{"datasource":{"type":"prometheus","uid":"prometheus"},"refId":"A","expr":"node_load1{job=\"openwrt\"}","legendFormat":"{{instance}}"}],"options":{"reduceOptions":{"calcs":["lastNotNull"]},"colorMode":"background","graphMode":"none","textMode":"value"}},
+{"id":22,"type":"stat","title":"ОЗУ роутера","datasource":{"type":"prometheus","uid":"prometheus"},"gridPos":{"x":12,"y":36,"w":4,"h":4},"fieldConfig":{"defaults":{"unit":"percent","decimals":0,"thresholds":{"mode":"absolute","steps":[{"color":"green","value":null},{"color":"orange","value":80},{"color":"red","value":90}]},"color":{"mode":"thresholds"}},"overrides":[]},"targets":[{"datasource":{"type":"prometheus","uid":"prometheus"},"refId":"A","expr":"(1 - node_memory_MemAvailable_bytes{job=\"openwrt\"} / node_memory_MemTotal_bytes{job=\"openwrt\"}) * 100","legendFormat":"{{instance}}"}],"options":{"reduceOptions":{"calcs":["lastNotNull"]},"colorMode":"background","graphMode":"none","textMode":"value"}},
+{"id":23,"type":"stat","title":"Клиенты Wi-Fi","datasource":{"type":"prometheus","uid":"prometheus"},"gridPos":{"x":16,"y":36,"w":4,"h":4},"fieldConfig":{"defaults":{"thresholds":{"mode":"absolute","steps":[{"color":"blue","value":null}]},"color":{"mode":"thresholds"}},"overrides":[]},"targets":[{"datasource":{"type":"prometheus","uid":"prometheus"},"refId":"A","expr":"sum by (instance) (wifi_stations{job=\"openwrt\"})","legendFormat":"{{instance}}"}],"options":{"reduceOptions":{"calcs":["lastNotNull"]},"colorMode":"background","graphMode":"none","textMode":"value"}},
+{"id":24,"type":"stat","title":"Conntrack роутера","datasource":{"type":"prometheus","uid":"prometheus"},"gridPos":{"x":20,"y":36,"w":4,"h":4},"fieldConfig":{"defaults":{"unit":"percent","decimals":0,"thresholds":{"mode":"absolute","steps":[{"color":"green","value":null},{"color":"orange","value":70},{"color":"red","value":90}]},"color":{"mode":"thresholds"}},"overrides":[]},"targets":[{"datasource":{"type":"prometheus","uid":"prometheus"},"refId":"A","expr":"node_nf_conntrack_entries{job=\"openwrt\"} / node_nf_conntrack_entries_limit{job=\"openwrt\"} * 100","legendFormat":"{{instance}}"}],"options":{"reduceOptions":{"calcs":["lastNotNull"]},"colorMode":"background","graphMode":"none","textMode":"value"}},
+{"id":25,"type":"timeseries","title":"Трафик WAN роутера","datasource":{"type":"prometheus","uid":"prometheus"},"gridPos":{"x":0,"y":40,"w":24,"h":8},"fieldConfig":{"defaults":{"unit":"bps","min":0},"overrides":[]},"targets":[{"datasource":{"type":"prometheus","uid":"prometheus"},"refId":"A","expr":"rate(node_network_receive_bytes_total{job=\"openwrt\",device=~\".*wan.*\"}[$__rate_interval]) * 8","legendFormat":"{{device}} приём"},{"datasource":{"type":"prometheus","uid":"prometheus"},"refId":"B","expr":"rate(node_network_transmit_bytes_total{job=\"openwrt\",device=~\".*wan.*\"}[$__rate_interval]) * 8","legendFormat":"{{device}} передача"}],"options":{"legend":{"displayMode":"list","placement":"bottom"},"tooltip":{"mode":"multi"}}}
 ]}
 EOF
   ok "Dashboard pve-overview: PVE overview (home page)"
@@ -895,6 +966,15 @@ show_targets
 SCRIPT
 }
 
+# @description Print the grafana.com dashboards to provision: the
+#   configured ones plus "OpenWrt" (11147) when routers are monitored.
+# @stdout Space separated dashboard IDs.
+dashboards_to_fetch() {
+  local ids="$GRAFANA_DASHBOARDS"
+  [[ -n "$OPENWRT_TARGETS" && " $ids " != *" 11147 "* ]] && ids+=" 11147"
+  printf '%s' "$ids"
+}
+
 # @description Run the container setup with settings and secrets passed
 #   through stdin.
 run_container_setup() {
@@ -912,7 +992,8 @@ run_container_setup() {
     [TG_CHAT_ID]="$TG_CHAT_ID"
     [GRAFANA]="$GRAFANA"
     [GRAFANA_APT_URL]="$GRAFANA_APT_URL"
-    [GRAFANA_DASHBOARDS]="$GRAFANA_DASHBOARDS"
+    [GRAFANA_DASHBOARDS]="$(dashboards_to_fetch)"
+    [OPENWRT_TARGETS]="$OPENWRT_TARGETS"
     [GRAFANA_ADMIN_PASSWORD]="$grafana_password"
   )
   [[ -n "${vars[HOST_IP]}" ]] || die "no IPv4 address on $CT_BRIDGE"
@@ -1020,6 +1101,7 @@ main() {
 
   EXISTING_ID="$(find_ct_by_hostname "$CT_HOSTNAME")"
   "${ACTIONS[$mode]}"
+  save_settings
   print_summary
   ok "Done. Log: $LOG_FILE"
 }
