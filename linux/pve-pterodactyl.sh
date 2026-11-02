@@ -716,7 +716,7 @@ write_wings_config() {
 }
 
 wings_version() {
-  /usr/local/bin/wings --version 2> /dev/null | grep -oE 'v[0-9][^ ]*' || true
+  /usr/local/bin/wings version 2> /dev/null | grep -oE 'v[0-9][^ ]*' || true
 }
 
 setup_wings() {
