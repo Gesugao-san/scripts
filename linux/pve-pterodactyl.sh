@@ -282,7 +282,13 @@ vm_ssh() {
 ensure_running() {
   qm status "$VM_ID" | grep -q 'running' && return 0
   log "Starting VM $VM_ID"
-  qm start "$VM_ID"
+  start_vm
+}
+
+# @description Start the VM without handing it the lock descriptor: the
+#   kvm process outlives the script and would keep the lock forever.
+start_vm() {
+  qm start "$VM_ID" 9>&-
 }
 
 # @description Wait until the VM answers SSH and cloud-init is finished.
@@ -362,7 +368,7 @@ create_vm() {
   # A recreated VM gets new host keys; forget the old ones for this IP.
   ssh-keygen -R "$(vm_address)" -f "$STATE_DIR/known_hosts" \
     > /dev/null 2>&1 || true
-  qm start "$VM_ID"
+  start_vm
   ok "VM $VM_ID created and started"
 }
 
