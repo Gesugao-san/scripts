@@ -662,13 +662,15 @@ groups:
         annotations:
           summary: "SMART reports {{ $labels.disk }} as failing"
 
+      # The Debian smartmon collector exports one metric per attribute,
+      # e.g. smartmon_reported_uncorrect_raw_value{disk, smart_id, type}.
       - alert: SmartErrorsGrowing
         expr: >-
-          increase(smartmon_attr_raw_value{name=~"reallocated_sector_ct|current_pending_sector|offline_uncorrectable|reported_uncorrect"}[1h]) > 0
+          increase({__name__=~"smartmon_(reallocated_sector_ct|current_pending_sector|offline_uncorrectable|reported_uncorrect)_raw_value"}[1h]) > 0
         labels:
           severity: warning
         annotations:
-          summary: "{{ $labels.disk }}: {{ $labels.name }} grew by {{ $value }} in 1h"
+          summary: "{{ $labels.disk }}: SMART {{ $labels.smart_id }} grew by {{ $value }} in 1h"
 
       - alert: FilesystemAlmostFull
         expr: >-
