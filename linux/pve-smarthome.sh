@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# @file pve-homeassistant.sh
+# @file pve-smarthome.sh
 # @brief Unattended deploy and update of Home Assistant (Container
 #   installation) in a Proxmox VM.
 # @description
@@ -22,13 +22,13 @@
 #   go through your proxy.
 #
 #   How to run:
-#     VM_IP=192.168.11.53/24 VM_GW=192.168.11.1 bash <(curl -fsSL https://raw.githubusercontent.com/Gesugao-san/scripts/master/linux/pve-homeassistant.sh)
+#     VM_IP=192.168.11.53/24 VM_GW=192.168.11.1 bash <(curl -fsSL https://raw.githubusercontent.com/Gesugao-san/scripts/master/linux/pve-smarthome.sh)
 
 # Settings are read by the shared library.
 # shellcheck disable=SC2034
 set -euo pipefail
 
-SERVICE="homeassistant"
+SERVICE="smarthome"
 PERSISTED_SETTINGS=(VM_IP VM_GW VM_DNS HA_VERSION HA_TZ)
 
 # ---- Shared library ----
@@ -60,7 +60,7 @@ pve_source pve-vm.sh
 guest_load_settings
 HA_VERSION="${HA_VERSION:-stable}"
 HA_TZ="${HA_TZ:-$(timedatectl show -p Timezone --value 2> /dev/null || echo UTC)}"
-VM_NAME="${VM_NAME:-homeassistant}"
+VM_NAME="${VM_NAME:-smarthome}"
 VM_CORES="${VM_CORES:-2}"
 VM_MEMORY="${VM_MEMORY:-4096}"
 VM_DISK_GB="${VM_DISK_GB:-32}"
@@ -105,7 +105,7 @@ CONFIG=/srv/homeassistant
 
 write_unit() {
   write_file /etc/systemd/system/homeassistant.service 644 << EOF
-# Managed by pve-homeassistant.sh, rewritten on every run.
+# Managed by pve-smarthome.sh, rewritten on every run.
 [Unit]
 Description=Home Assistant (container)
 After=docker.service network-online.target

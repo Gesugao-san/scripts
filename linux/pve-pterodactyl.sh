@@ -57,7 +57,9 @@ load_settings() {
 
 load_settings
 
-VM_NAME="${VM_NAME:-ptero}"
+VM_NAME="${VM_NAME:-games}"
+# The VM was called "ptero" before; it is found and renamed.
+LEGACY_NAME="ptero"
 VM_ID="${VM_ID:-}"
 VM_STORAGE="${VM_STORAGE:-}"
 VM_CORES="${VM_CORES:-4}"
@@ -128,7 +130,7 @@ Environment (all optional unless noted):
   VM_IP                static address, CIDR, required for a new VM
   VM_GW                gateway, required for a new VM
   VM_DNS               DNS server                         [host default]
-  VM_NAME              VM name, also used to find it again        [ptero]
+  VM_NAME              VM name, also used to find it again        [games]
   VM_ID                ID for a new VM                       [next free]
   VM_STORAGE           storage for the disk                       [auto]
   VM_CORES             CPU cores                                     [4]
@@ -249,6 +251,30 @@ ensure_ssh_key() {
 # @stdout VM ID, empty when none.
 find_vm_by_name() {
   qm list | awk -v name="$1" 'NR > 1 && $2 == name { print $1; exit }'
+}
+
+# @description Find the VM under its old name and give it the new one, so
+#   an update does not create a second VM. Inside, cloud-init is told to
+#   keep the SSH host keys: the new name changes its instance ID, and it
+#   would otherwise make new keys on the next boot.
+adopt_legacy_vm() {
+  [[ "$VM_NAME" != "$LEGACY_NAME" ]] || return 0
+  local id
+  id="$(find_vm_by_name "$LEGACY_NAME")"
+  [[ -n "$id" ]] || return 0
+  if [[ -n "$VM_IP" ]]; then
+    VM_ID="$id"
+    # The commands go through stdin: ssh would split quoted arguments.
+    printf '%s\n' \
+      "echo 'ssh_deletekeys: false' > /etc/cloud/cloud.cfg.d/99-pve-keep-keys.cfg" \
+      "hostnamectl set-hostname '$VM_NAME'" \
+      "sed -i 's/\\b$LEGACY_NAME\\b/$VM_NAME/g' /etc/hosts" \
+      | vm_ssh sh -e \
+      || warn "could not rename the host inside the VM"
+  fi
+  qm set "$id" --name "$VM_NAME" > /dev/null
+  ok "VM $id renamed: $LEGACY_NAME -> $VM_NAME"
+  EXISTING_ID="$id"
 }
 
 # @description Print the active storage with the most free space that
@@ -691,7 +717,7 @@ setup_node() {
     artisan p:location:make --short=home --long="Proxmox at home" > /dev/null
     location_id="$(mariadb -N panel -e "$query")"
   fi
-  artisan p:node:make --name=pve --description="Wings in the ptero VM" \
+  artisan p:node:make --name=pve --description="Wings in the games VM" \
     --locationId="$location_id" --fqdn="$VM_ADDRESS" --public=1 \
     --scheme=http --proxy=0 --maintenance=0 \
     --maxMemory="$NODE_MEMORY" --overallocateMemory=0 \
@@ -901,6 +927,7 @@ main() {
   log "pve-pterodactyl.sh started $(date '+%F %T'), mode $mode"
 
   EXISTING_ID="$(find_vm_by_name "$VM_NAME")"
+  [[ -n "$EXISTING_ID" ]] || adopt_legacy_vm
   "${ACTIONS[$mode]}"
   save_settings
   print_summary

@@ -28,7 +28,9 @@ set -euo pipefail
 
 # ---- Settings (environment overrides) ----
 
-CT_HOSTNAME="${CT_HOSTNAME:-xui}"
+CT_HOSTNAME="${CT_HOSTNAME:-vpn}"
+# The container was called "xui" before; it is found and renamed.
+LEGACY_HOSTNAME="xui"
 CT_ID="${CT_ID:-}"
 CT_STORAGE="${CT_STORAGE:-}"
 CT_TEMPLATE_STORAGE="${CT_TEMPLATE_STORAGE:-}"
@@ -99,7 +101,7 @@ Modes:
   --update   only update an existing container, fail if it is missing
 
 Environment (all optional):
-  CT_HOSTNAME          hostname, also used to find the CT again  [xui]
+  CT_HOSTNAME          hostname, also used to find the CT again  [vpn]
   CT_ID                ID for a new container               [next free]
   CT_STORAGE           storage for the root disk                 [auto]
   CT_TEMPLATE_STORAGE  storage for templates                     [auto]
@@ -570,6 +572,22 @@ print_summary() {
 
 # ---- Actions ----
 
+# @description Find the container under its old name and give it the new
+#   one, so an update does not create a second container.
+adopt_legacy_container() {
+  [[ "$CT_HOSTNAME" != "$LEGACY_HOSTNAME" ]] || return 0
+  local id
+  id="$(find_ct_by_hostname "$LEGACY_HOSTNAME")"
+  [[ -n "$id" ]] || return 0
+  pct set "$id" --hostname "$CT_HOSTNAME"
+  # Apply it inside right away; PVE rewrites these files on the next start.
+  pct exec "$id" -- sh -c "echo '$CT_HOSTNAME' > /etc/hostname \
+    && hostname '$CT_HOSTNAME' \
+    && sed -i 's/\\b$LEGACY_HOSTNAME\\b/$CT_HOSTNAME/g' /etc/hosts" || true
+  ok "CT $id renamed: $LEGACY_HOSTNAME -> $CT_HOSTNAME"
+  EXISTING_ID="$id"
+}
+
 # ID of the container that already has $CT_HOSTNAME, empty when none.
 EXISTING_ID=""
 
@@ -639,6 +657,7 @@ main() {
   log "pve-3x-ui.sh started $(date '+%F %T'), mode $mode"
 
   EXISTING_ID="$(find_ct_by_hostname "$CT_HOSTNAME")"
+  [[ -n "$EXISTING_ID" ]] || adopt_legacy_container
   "${ACTIONS[$mode]}"
   print_summary
   ok "Done. Log: $LOG_FILE"

@@ -85,7 +85,9 @@ CT_IP="${CT_IP:-dhcp}"
 CT_GW="${CT_GW:-}"
 KEEP_SNAPSHOTS="${KEEP_SNAPSHOTS:-3}"
 RETENTION="${RETENTION:-30d}"
-XUI_HOSTNAME="${XUI_HOSTNAME:-xui}"
+XUI_HOSTNAME="${XUI_HOSTNAME:-vpn}"
+# The 3x-ui container was renamed from "xui"; follow saved settings along.
+[[ "$XUI_HOSTNAME" != "xui" ]] || XUI_HOSTNAME="vpn"
 XUI_PROBE_PORTS="${XUI_PROBE_PORTS:-443}"
 OPENWRT_TARGETS="${OPENWRT_TARGETS:-}"
 TG_BOT_TOKEN="${TG_BOT_TOKEN:-}"
@@ -158,7 +160,7 @@ Environment (all optional):
   CT_GW                gateway, required with a static CT_IP
   KEEP_SNAPSHOTS       update snapshots to keep                     [3]
   RETENTION            how long Prometheus keeps data             [30d]
-  XUI_HOSTNAME         3x-ui container to probe, if it exists     [xui]
+  XUI_HOSTNAME         3x-ui container to probe, if it exists     [vpn]
   XUI_PROBE_PORTS      Xray ports to probe, space separated       [443]
   OPENWRT_TARGETS      OpenWrt exporters, "ip:port" words        [none]
                        (see openwrt/prometheus-node-exporter.sh)
