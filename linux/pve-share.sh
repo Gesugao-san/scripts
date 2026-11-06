@@ -336,7 +336,8 @@ setup_copyparty() {
     || useradd --system --home-dir /var/lib/copyparty --shell /usr/sbin/nologin copyparty
   install -d -m 750 -o copyparty -g copyparty /var/lib/copyparty /etc/copyparty
   local dir
-  for dir in "" public media family friends lovers inbox work contacts; do
+  for dir in "" public media media/films media/series media/music \
+    family friends lovers inbox work contacts; do
     install -d -m 750 -o copyparty -g copyparty "$DATA/$dir"
   done
   ok "copyparty $("$VENV/bin/pip" show copyparty | awk '/^Version/ { print $2 }')"
