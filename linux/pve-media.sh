@@ -282,7 +282,7 @@ EOF
 # Lets Jellyfin read the share files (their group) and use the iGPU.
 grant_access() {
   local group
-  group="$(getent group "$MEDIA_FILES_GID" | cut -d: -f1)"
+  group="$( (getent group "$MEDIA_FILES_GID" || true) | cut -d: -f1)"
   if [[ -z "$group" ]]; then
     groupadd --gid "$MEDIA_FILES_GID" share-files
     group=share-files
@@ -306,21 +306,28 @@ check_gpu() {
   fi
 }
 
+# Waits until Jellyfin serves requests. While it starts, the public info
+# already answers but everything else gets 503, so a wizard endpoint is
+# polled: 200 before the wizard, 401 after it.
 wait_api() {
-  local waited=0
+  local waited=0 code
   log "Waiting for Jellyfin (the first start and upgrades migrate the database)"
-  until curl -fsS "$API/System/Info/Public" > /dev/null 2>&1; do
+  while :; do
+    code="$(curl -s -o /dev/null -w '%{http_code}' "$API/Startup/User" || true)"
+    [[ "$code" != "200" && "$code" != "401" ]] || return 0
     ((waited += 3))
     ((waited < 600)) || fail "Jellyfin does not answer on $API"
     sleep 3
   done
 }
 
-# Runs the startup wizard once: Russian, owner account, LAN only.
+# Runs the startup wizard once: Russian, owner account, LAN only. Sets
+# FRESH=1 when it ran. Called as a plain command, never in an "&&" list,
+# so that a failed request stops the setup.
 first_setup() {
   local completed
   completed="$(curl -fsS "$API/System/Info/Public" | jq -r .StartupWizardCompleted)"
-  [[ "$completed" != "true" ]] || return 1
+  [[ "$completed" != "true" ]] || return 0
   log "Running the startup wizard"
   api POST /Startup/Configuration \
     '{"ServerName":"media","UICulture":"ru","MetadataCountryCode":"RU","PreferredMetadataLanguage":"ru"}' > /dev/null
@@ -330,6 +337,7 @@ first_setup() {
   api POST /Startup/RemoteAccess \
     '{"EnableRemoteAccess":false,"EnableAutomaticPortMapping":false}' > /dev/null
   api POST /Startup/Complete > /dev/null
+  FRESH=1
   ok "Owner account $MEDIA_OWNER created"
 }
 
@@ -438,10 +446,10 @@ main() {
   grant_access
   check_gpu
   wait_api
-  local fresh=0
-  first_setup && fresh=1
+  FRESH=0
+  first_setup
   sign_in
-  ((fresh == 0)) || setup_transcoding
+  ((FRESH == 0)) || setup_transcoding
   add_libraries
   sync_users
   log "Jellyfin: $(systemctl is-active jellyfin)"
