@@ -2,34 +2,47 @@
 #
 # @file pve-share.sh
 # @brief Unattended deploy and update of a file server (copyparty) in a
-#   Proxmox LXC container.
+#   Proxmox LXC container, with access by groups of people.
 # @description
 #   Runs on a Proxmox VE host as root and needs no answers. In an
 #   unprivileged container ($CT_HOSTNAME, created when missing) with the
 #   files on a separate volume (SHARE_STORAGE, SHARE_DISK_GB, mounted at
-#   /srv/share). The volume is included in backups: with Proxmox Backup
-#   Server only changed blocks are sent each night.
+#   /srv/share). The volume is backed up with the container; Proxmox Backup
+#   Server sends only changed blocks each night.
 #
-#   * copyparty (from PyPI) on port 3923: browser up- and downloads with
-#     resume, WebDAV, search, thumbnails, share links;
-#   * accounts with generated passwords, in groups:
-#     - SHARE_ADMIN: full control of the pool and the inbox;
-#     - SHARE_FAMILY: personal logins plus one shared family login, read
-#       and write the pool;
-#     - SHARE_FRIENDS: read the pool;
-#   * volumes:
-#     - /pool   shared, SHARE_POOL_GB at most;
-#     - /home/<login>  one per login, only its owner gets in,
-#       SHARE_HOME_GB at most;
-#     - /inbox  every login can drop files in, only the admin sees them.
+#   People and their groups live in /root/pve-share/people.conf on the host,
+#   one line per login: "login group group ...". A template with placeholder
+#   logins is written on the first run. Passwords are generated on the host
+#   (users/<login>, mode 600). Groups:
+#
+#     family friends lovers mods admins contacts work-<organisation>
+#
+#   SHARE_ADMIN (the owner) is not listed there and gets everything.
+#
+#   | Folder                  | Writes          | Reads                       |
+#   |-------------------------|-----------------|-----------------------------|
+#   | /public                 | owner           | everyone, even anonymous    |
+#   | /media                  | owner           | family friends lovers mods  |
+#   |                         |                 | admins ("own people")       |
+#   | /family                 | family          | family; never mods/admins   |
+#   | /friends                | friends         | friends lovers mods admins  |
+#   | /lovers                 | owner           | lovers; never mods/admins   |
+#   | /work/<org>/common      | owner           | that organisation           |
+#   | /work/<org>/<login>     | that login      | that login                  |
+#   | /contacts/common        | owner           | contacts                    |
+#   | /contacts/<login>       | that login      | that login                  |
+#   | /inbox                  | every login     | owner                       |
+#
+#   "never" is a subtraction: someone in family and in mods stays out of
+#   /family. Organisations do not see each other. Personal folders appear
+#   on the login's first visit and hold SHARE_PERSONAL_GB at most; the
+#   inbox holds SHARE_INBOX_GB.
 #
 #   Rights in copyparty belong to a volume and every subfolder inside it
-#   inherits them. A volume mounted inside another one does not inherit
-#   anything: it replaces the rights completely, so it must list everyone.
-#
-#   Running it again snapshots the container, upgrades Debian and
-#   copyparty, adds new logins and rewrites the config. A renamed login
-#   gets a new, empty home: move the old folder by hand.
+#   inherits them; a volume mounted inside another one replaces them.
+#   Anyone with root on the host or a console in the container can still
+#   read every file: encrypt on the devices (Cryptomator, Syncthing
+#   untrusted mode) what must stay private even from them.
 #
 #   How to run (the data volume is required for a new container):
 #     SHARE_STORAGE=tank bash <(curl -fsSL https://raw.githubusercontent.com/Gesugao-san/scripts/master/linux/pve-share.sh)
@@ -39,9 +52,7 @@
 set -euo pipefail
 
 SERVICE="share"
-PERSISTED_SETTINGS=(
-  SHARE_ADMIN SHARE_FAMILY SHARE_FRIENDS SHARE_POOL_GB SHARE_HOME_GB
-)
+PERSISTED_SETTINGS=(SHARE_ADMIN SHARE_PERSONAL_GB SHARE_INBOX_GB)
 
 # ---- Shared library ----
 
@@ -71,27 +82,87 @@ pve_source pve-ct.sh
 
 guest_load_settings
 SHARE_ADMIN="${SHARE_ADMIN:-gesu}"
-SHARE_FAMILY="${SHARE_FAMILY-fam1 fam2 fam3 family}"
-SHARE_FRIENDS="${SHARE_FRIENDS-friend1 friend2}"
-SHARE_POOL_GB="${SHARE_POOL_GB:-100}"
-SHARE_HOME_GB="${SHARE_HOME_GB:-5}"
+SHARE_PERSONAL_GB="${SHARE_PERSONAL_GB:-5}"
+SHARE_INBOX_GB="${SHARE_INBOX_GB:-10}"
 SHARE_STORAGE="${SHARE_STORAGE:-}"
+SHARE_DISK_GB="${SHARE_DISK_GB:-150}"
 CT_DISK_GB="${CT_DISK_GB:-8}"
 CT_MEMORY="${CT_MEMORY:-1024}"
 CT_CORES="${CT_CORES:-2}"
 CT_DESCRIPTION="File server (copyparty)"
 ct_defaults
 
-# @description Print all logins: admin, family, friends.
-# @stdout Space separated logins.
-all_logins() {
-  # Word splitting is intended: one login per word.
-  # shellcheck disable=SC2086
-  printf '%s ' "$SHARE_ADMIN" $SHARE_FAMILY $SHARE_FRIENDS
+PEOPLE_FILE="$STATE_DIR/people.conf"
+
+# Groups a login may belong to; work-<organisation> is checked separately.
+KNOWN_GROUPS=" family friends lovers mods admins contacts "
+
+# Logins that would clash with folder names.
+RESERVED_LOGINS=" common public media inbox "
+
+# ---- People ----
+
+# @description Write the people file with placeholder logins, once.
+ensure_people_file() {
+  [[ -f "$PEOPLE_FILE" ]] && return 0
+  install -d -m 700 "$STATE_DIR"
+  (umask 077 && cat > "$PEOPLE_FILE") << 'EOF'
+# People of the file server, one login per line: login group group ...
+# Groups: family friends lovers mods admins contacts work-<organisation>
+# Rename the placeholders before anyone stores files: a personal folder
+# follows the login name. Run pve-share.sh again after every change.
+fam1        family
+fam2        family
+family      family
+friend1     friends
+friend2     friends
+lover1      lovers
+mod1        friends mods
+admin1      friends admins
+worker1     work-kadr26
+contact1    contacts
+EOF
+  ok "People file created with placeholders: $PEOPLE_FILE"
 }
 
-# Room for the pool, every home and 10% for the index and slack.
-SHARE_DISK_GB="${SHARE_DISK_GB:-$(((SHARE_POOL_GB + SHARE_HOME_GB * $(wc -w <<< "$(all_logins)")) * 11 / 10))}"
+# @description Print the people file without comments and blank lines.
+# @stdout "login group ..." lines.
+people_lines() {
+  sed -e 's/#.*//' -e 's/[[:space:]]\+/ /g' -e 's/^ //' -e 's/ $//' "$PEOPLE_FILE" \
+    | sed '/^$/d'
+}
+
+# @description Fail on bad logins, unknown groups or duplicates.
+check_people() {
+  local login groups group
+  while read -r login groups; do
+    [[ "$login" =~ ^[a-z][a-z0-9_-]{0,31}$ ]] \
+      || die "people.conf: bad login '$login' (a-z, 0-9, '_', '-')"
+    [[ "$RESERVED_LOGINS" != *" $login "* ]] \
+      || die "people.conf: '$login' is reserved, pick another login"
+    [[ "$login" != "$SHARE_ADMIN" ]] \
+      || die "people.conf: the owner '$login' must not be listed"
+    [[ -n "$groups" ]] || die "people.conf: '$login' has no group"
+    for group in $groups; do
+      [[ "$KNOWN_GROUPS" == *" $group "* || "$group" =~ ^work-[a-z0-9]+$ ]] \
+        || die "people.conf: unknown group '$group' for '$login'"
+    done
+  done < <(people_lines)
+  local dupes
+  dupes="$(people_lines | awk '{ print $1 }' | sort | uniq -d)"
+  [[ -z "$dupes" ]] || die "people.conf: listed twice: $dupes"
+}
+
+# @description Print "login:password" for the owner and every person,
+#   creating passwords on the host when they are new.
+# @stdout One line per login.
+all_credentials() {
+  local login _
+  printf '%s:%s\n' "$SHARE_ADMIN" "$(secret_or_new "users/$SHARE_ADMIN")"
+  while read -r login _; do
+    printf '%s:%s\n' "$login" "$(secret_or_new "users/$login")"
+  done < <(people_lines)
+}
 
 # ---- Hooks ----
 
@@ -99,28 +170,23 @@ service_usage() {
   cat << EOF
 
 Share (environment):
-  SHARE_STORAGE   storage for the data volume, new CT only (required)
-  SHARE_DISK_GB   size of the data volume, GiB, new CT only
-                                     [pool + homes + 10% = $SHARE_DISK_GB]
+  SHARE_STORAGE      storage for the data volume, new CT only (required)
+  SHARE_DISK_GB      size of the data volume, GiB, new CT only [$SHARE_DISK_GB]
   remembered:
-  SHARE_ADMIN     admin login                         [$SHARE_ADMIN]
-  SHARE_FAMILY    family logins, read-write pool      [$SHARE_FAMILY]
-  SHARE_FRIENDS   friend logins, read-only pool       [$SHARE_FRIENDS]
-  SHARE_POOL_GB   limit of the shared pool, GiB       [$SHARE_POOL_GB]
-  SHARE_HOME_GB   limit of each personal folder, GiB  [$SHARE_HOME_GB]
+  SHARE_ADMIN        owner login, full rights          [$SHARE_ADMIN]
+  SHARE_PERSONAL_GB  limit of each personal folder, GiB [$SHARE_PERSONAL_GB]
+  SHARE_INBOX_GB     limit of the inbox, GiB            [$SHARE_INBOX_GB]
+
+People and groups: $PEOPLE_FILE
 EOF
 }
 
 service_preflight() {
-  local name
-  for name in $(all_logins); do
-    [[ "$name" =~ ^[a-z][a-z0-9_-]{0,31}$ ]] \
-      || die "bad login '$name': use a-z, 0-9, '_' and '-'"
-  done
-  [[ "$(all_logins | tr ' ' '\n' | sed '/^$/d' | sort | uniq -d)" == "" ]] \
-    || die "a login appears twice in SHARE_ADMIN/FAMILY/FRIENDS"
-  [[ "$SHARE_POOL_GB" =~ ^[0-9]+$ && "$SHARE_HOME_GB" =~ ^[0-9]+$ ]] \
-    || die "SHARE_POOL_GB and SHARE_HOME_GB must be numbers"
+  [[ "$SHARE_ADMIN" =~ ^[a-z][a-z0-9_-]{0,31}$ ]] || die "bad SHARE_ADMIN"
+  [[ "$SHARE_PERSONAL_GB" =~ ^[0-9]+$ && "$SHARE_INBOX_GB" =~ ^[0-9]+$ ]] \
+    || die "SHARE_PERSONAL_GB and SHARE_INBOX_GB must be numbers"
+  ensure_people_file
+  check_people
   [[ -z "$EXISTING_ID" ]] || return 0
   [[ -n "$SHARE_STORAGE" ]] || die "a new share needs SHARE_STORAGE (see --help)"
   pvesm status --storage "$SHARE_STORAGE" > /dev/null 2>&1 \
@@ -132,33 +198,20 @@ service_create_args() {
   printf '%s\n' --mp0 "$SHARE_STORAGE:$SHARE_DISK_GB,mp=/srv/share,backup=1"
 }
 
-# @description Print "login:password" lines, creating new passwords on the
-#   host.
-# @stdout One line per login.
-all_credentials() {
-  local name
-  for name in $(all_logins); do
-    printf '%s:%s\n' "$name" "$(secret_or_new "users/$name")"
-  done
-}
-
 service_exports() {
   export_var SHARE_ADMIN "$SHARE_ADMIN"
-  export_var SHARE_FAMILY "$SHARE_FAMILY"
-  export_var SHARE_FRIENDS "$SHARE_FRIENDS"
-  export_var SHARE_POOL_GB "$SHARE_POOL_GB"
-  export_var SHARE_HOME_GB "$SHARE_HOME_GB"
+  export_var SHARE_PERSONAL_GB "$SHARE_PERSONAL_GB"
+  export_var SHARE_INBOX_GB "$SHARE_INBOX_GB"
+  export_var SHARE_PEOPLE "$(people_lines)"
   export_var SHARE_CREDENTIALS "$(all_credentials)"
 }
 
 service_summary() {
   local ip
   ip="$(guest_address || true)"
-  printf 'Web       : http://%s:3923/\n' "$ip"
-  printf 'WebDAV    : http://%s:3923/  (same logins)\n' "$ip"
-  printf 'Logins    : ls %s/users/   (password: cat users/<login>)\n' "$STATE_DIR"
-  printf 'Volumes   : /pool %sG, /home/<login> %sG each, /inbox\n' \
-    "$SHARE_POOL_GB" "$SHARE_HOME_GB"
+  printf 'Web       : http://%s:3923/   (WebDAV on the same address)\n' "$ip"
+  printf 'People    : %s (%s logins)\n' "$PEOPLE_FILE" "$(people_lines | wc -l)"
+  printf 'Passwords : %s/users/<login>\n' "$STATE_DIR"
 }
 
 # ---- Inside the container ----
@@ -167,27 +220,67 @@ service_script() {
   cat << 'SCRIPT'
 VENV=/opt/copyparty
 DATA=/srv/share
+CONF=/etc/copyparty/copyparty.conf
 
-setup_copyparty() {
-  apt_install python3-venv python3-pil
-  [[ -x "$VENV/bin/pip" ]] || python3 -m venv --system-site-packages "$VENV"
-  log "Installing or upgrading copyparty from PyPI"
-  "$VENV/bin/pip" install --quiet --upgrade pip copyparty
-  id copyparty > /dev/null 2>&1 \
-    || useradd --system --home-dir /var/lib/copyparty --shell /usr/sbin/nologin copyparty
-  install -d -m 750 -o copyparty -g copyparty /var/lib/copyparty
-  install -d -m 750 -o copyparty -g copyparty \
-    "$DATA" "$DATA/pool" "$DATA/home" "$DATA/inbox"
-  ok "copyparty $("$VENV/bin/pip" show copyparty | awk '/^Version/ { print $2 }')"
+# Members of every group, filled by load_people: MEMBERS[group]="a b c".
+declare -A MEMBERS=()
+
+load_people() {
+  local login groups group
+  while read -r login groups; do
+    [[ -n "$login" ]] || continue
+    for group in $groups; do
+      MEMBERS[$group]+="${MEMBERS[$group]:+ }$login"
+    done
+  done <<< "$SHARE_PEOPLE"
 }
 
-# Prints a comma separated list from space separated words.
-csv() {
-  # shellcheck disable=SC2086 # one word per element
-  printf '%s\n' $1 | paste -sd, - | sed 's/,/, /g'
+# Prints "@a, @b" for the groups that have members; with -, prints
+# ", -@a, -@b" to subtract them instead.
+groups_list() {
+  local sign="" group out=""
+  if [[ "$1" == "-" ]]; then
+    sign="-"
+    shift
+  fi
+  for group in "$@"; do
+    [[ -n "${MEMBERS[$group]:-}" ]] || continue
+    out+="${out:+, }${sign}@$group"
+  done
+  [[ -z "$sign" || -z "$out" ]] || out=", $out"
+  printf '%s' "$out"
+}
+
+# Prints "PERM: WHO" when WHO is not empty; nothing otherwise, so groups
+# without members drop out. A subtraction alone grants nothing.
+acc() {
+  [[ -n "$2" ]] || return 0
+  printf '%s: %s%s' "$1" "$2" "${3:-}"
+}
+
+# Prints a volume: volume URL PATH, then "perm: who" lines (empty ones are
+# skipped), then "flag:" lines.
+volume() {
+  local url="$1" path="$2"
+  shift 2
+  printf '\n[%s]\n  %s\n  accs:\n' "$url" "$path"
+  local line
+  for line in "$@"; do
+    [[ -n "$line" && "$line" != flag:* ]] || continue
+    printf '    %s\n' "$line"
+  done
+  local flags=()
+  for line in "$@"; do
+    [[ "$line" == flag:* ]] && flags+=("${line#flag:}")
+  done
+  ((${#flags[@]})) || return 0
+  printf '  flags:\n'
+  printf '    %s\n' "${flags[@]}"
 }
 
 write_config() {
+  local owner="$SHARE_ADMIN" org deny_staff
+  deny_staff="$(groups_list - mods admins)"
   {
     cat << EOF
 # Managed by pve-share.sh, rewritten on every run.
@@ -201,28 +294,52 @@ write_config() {
 EOF
     printf '%s\n' "$SHARE_CREDENTIALS" | sed 's/^\([^:]*\):/  \1: /'
     printf '\n[groups]\n'
-    [[ -z "$SHARE_FAMILY" ]] || printf '  family: %s\n' "$(csv "$SHARE_FAMILY")"
-    [[ -z "$SHARE_FRIENDS" ]] || printf '  friends: %s\n' "$(csv "$SHARE_FRIENDS")"
-    printf '\n[/pool]\n  %s/pool\n  accs:\n    A: %s\n' "$DATA" "$SHARE_ADMIN"
-    [[ -z "$SHARE_FAMILY" ]] || printf '    rwmd: @family\n'
-    [[ -z "$SHARE_FRIENDS" ]] || printf '    r: @friends\n'
-    printf '  flags:\n    vmaxb: %sg\n' "$SHARE_POOL_GB"
-    cat << EOF
+    for group in "${!MEMBERS[@]}"; do
+      printf '  %s: %s\n' "$group" "${MEMBERS[$group]// /, }"
+    done | sort
 
-[/home/\${u}]
-  $DATA/home/\${u}
-  accs:
-    rwmd: \${u}
-  flags:
-    vmaxb: ${SHARE_HOME_GB}g
+    volume /public "$DATA/public" "r: *" "A: $owner"
+    volume /media "$DATA/media" \
+      "$(acc r "$(groups_list family friends lovers mods admins)")" "A: $owner"
+    volume /family "$DATA/family" \
+      "$(acc rwmd "$(groups_list family)" "$deny_staff")" "A: $owner"
+    volume /friends "$DATA/friends" \
+      "$(acc rwmd "$(groups_list friends)")" \
+      "$(acc r "$(groups_list lovers mods admins)")" "A: $owner"
+    volume /lovers "$DATA/lovers" \
+      "$(acc r "$(groups_list lovers)" "$deny_staff")" "A: $owner"
 
-[/inbox]
-  $DATA/inbox
-  accs:
-    w: @acct
-    A: $SHARE_ADMIN
-EOF
-  } | write_file /etc/copyparty/copyparty.conf 600 copyparty:copyparty
+    for org in $(printf '%s\n' "${!MEMBERS[@]}" | grep '^work-' | sort); do
+      volume "/work/${org#work-}/common" "$DATA/work/${org#work-}/common" \
+        "r: @$org" "A: $owner"
+      volume "/work/${org#work-}/\${u%+$org}" "$DATA/work/${org#work-}/\${u}" \
+        "rwmd: \${u}" "A: $owner" "flag:vmaxb: ${SHARE_PERSONAL_GB}g"
+    done
+
+    if [[ -n "${MEMBERS[contacts]:-}" ]]; then
+      volume /contacts/common "$DATA/contacts/common" "r: @contacts" "A: $owner"
+      volume "/contacts/\${u%+contacts}" "$DATA/contacts/\${u}" \
+        "rwmd: \${u}" "A: $owner" "flag:vmaxb: ${SHARE_PERSONAL_GB}g"
+    fi
+
+    volume /inbox "$DATA/inbox" "w: @acct" "A: $owner" \
+      "flag:vmaxb: ${SHARE_INBOX_GB}g"
+  } | write_file "$CONF" 600 copyparty:copyparty
+}
+
+setup_copyparty() {
+  apt_install python3-venv python3-pil
+  [[ -x "$VENV/bin/pip" ]] || python3 -m venv --system-site-packages "$VENV"
+  log "Installing or upgrading copyparty from PyPI"
+  "$VENV/bin/pip" install --quiet --upgrade pip copyparty
+  id copyparty > /dev/null 2>&1 \
+    || useradd --system --home-dir /var/lib/copyparty --shell /usr/sbin/nologin copyparty
+  install -d -m 750 -o copyparty -g copyparty /var/lib/copyparty /etc/copyparty
+  local dir
+  for dir in "" public media family friends lovers inbox work contacts; do
+    install -d -m 750 -o copyparty -g copyparty "$DATA/$dir"
+  done
+  ok "copyparty $("$VENV/bin/pip" show copyparty | awk '/^Version/ { print $2 }')"
 }
 
 write_unit() {
@@ -236,7 +353,7 @@ Wants=network-online.target
 [Service]
 User=copyparty
 WorkingDirectory=/var/lib/copyparty
-ExecStart=$VENV/bin/copyparty -c /etc/copyparty/copyparty.conf
+ExecStart=$VENV/bin/copyparty -c $CONF
 Restart=always
 RestartSec=5s
 NoNewPrivileges=yes
@@ -254,6 +371,7 @@ EOF
 main() {
   upgrade_os
   mountpoint -q "$DATA" || warn "$DATA is not a separate volume"
+  load_people
   setup_copyparty
   write_config
   write_unit
