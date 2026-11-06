@@ -27,6 +27,7 @@
 #   | service_after_create| once, right after the guest was created       |
 #   | service_exports     | settings and secrets for the guest setup      |
 #   | service_script      | the setup run inside the guest (required)     |
+#   | service_after_setup | on the host, after the guest setup succeeded  |
 #   | service_summary     | extra lines of the final summary              |
 #
 #   A line "@@secret NAME VALUE" printed by the guest setup is saved as
@@ -88,6 +89,7 @@ service_host_setup() { :; }
 service_create_args() { :; }
 service_after_create() { :; }
 service_exports() { :; }
+service_after_setup() { :; }
 service_summary() { :; }
 
 # ---- Settings (environment > saved > default) ----
@@ -339,6 +341,7 @@ action_install() {
   guest_restart_if_needed
   guest_wait_ready
   guest_run_setup
+  service_after_setup
 }
 
 # @description Snapshot the guest and run the setup again, which updates it.
@@ -353,6 +356,7 @@ action_update() {
   guest_restart_if_needed
   guest_wait_ready
   guest_run_setup
+  service_after_setup
 }
 
 # @description Pick install or update depending on whether the guest exists.
