@@ -16,12 +16,19 @@ where clamp25519 is the standard Curve25519/Ed25519 scalar clamping:
 The result is 32 bytes (a private scalar), shown as 52 base32 characters.
 
 Data format: CSV with ";" as the delimiter, columns
-	password;hash;channel;note
-"channel" and "note" are optional and never checked: "encode" copies them
-to the output unchanged, "verify" ignores them. A first row whose password
-column is "password" (any case) is treated as a header:
-"encode" copies it, "verify" skips it. Fields containing ";" or quotes use
-standard CSV quoting.
+	password;hash;channel;note;invite
+Only "password" and "hash" are required. "encode" copies the other columns
+to the output unchanged. "verify" ignores "note"; "channel" is only compared
+with the channel name in "invite". A first row whose password column is
+"password" (any case) is treated as a header: "encode" copies it, "verify"
+skips it. Fields containing ";" or quotes use standard CSV quoting.
+
+Invite links look like "dsc:HASHID?dn=NAME", where HASHID is the channel's
+Hash-ID (52 base32 characters) and NAME is the URL-encoded channel name.
+The Hash-ID depends on both the key and the channel name, but the exact
+formula is unknown (Tixati is closed source), so it can not be derived or
+checked against the key: "decode" and "verify" only check the link format
+and that the name matches the "channel" column.
 
 Caveats:
 	- The scheme was confirmed on ASCII input only; UTF-8 is assumed for
@@ -36,6 +43,8 @@ Usage:
 	tixati-channel-key.py verify -f channels.csv
 	(see tixati-channel-key.example.csv)
 	tixati-channel-key.py encode a b | tixati-channel-key.py verify
+	tixati-channel-key.py decode "dsc:HASHID?dn=NAME" [LINK ...]
+	tixati-channel-key.py decode -f links.txt     (one link per line)
 
 	"-f FILE" works in every shell, including PowerShell, which has no "<"
 	redirection. Without "-f" and positional arguments, CSV is read from
@@ -43,12 +52,16 @@ Usage:
 	output is written as UTF-8, regardless of the Windows console code page.
 
 Output of "verify": one "STATUS;password;hash" row per data row, where
-STATUS is OK, MISMATCH or INVALID; reasons for INVALID go to stderr.
+STATUS is OK, MISMATCH or INVALID; the reason for anything but OK goes to
+stderr with the line number.
+
+Output of "decode": one "hashid;name" row per valid link; invalid links are
+reported on stderr.
 
 Exit codes:
 	0 - success / all rows match
-	1 - at least one row does not match
-	2 - invalid input (malformed hash, empty password, unreadable file)
+	1 - at least one row does not match (hash or invite name)
+	2 - invalid input (malformed hash or link, empty password, bad file)
 """
 
 import argparse
@@ -59,6 +72,8 @@ import hashlib
 import hmac
 import sys
 from collections.abc import Iterator
+from typing import NamedTuple
+from urllib.parse import parse_qs, unquote, urlsplit
 
 KEY_BYTES = 32
 KEY_CHARS = 52
@@ -76,6 +91,10 @@ STATUS_NAMES = {
 DELIMITER = ";"
 COL_PASSWORD = 0
 COL_HASH = 1
+COL_CHANNEL = 2
+COL_INVITE = 4
+
+INVITE_SCHEME = "dsc"
 
 HEADER_NAMES = {"password"}
 
@@ -149,13 +168,81 @@ def encode_string(text: str) -> str:
 	return key_to_text(derive_key(text))
 
 
+class Invite(NamedTuple):
+	"""Parsed invite link: channel Hash-ID and (optional) channel name."""
+
+	hash_id: str
+	name: str | None
+
+
+def parse_invite(link: str) -> Invite | None:
+	"""
+	Parse a Tixati channel invite link "dsc:HASHID?dn=NAME".
+
+	@param link Invite link (surrounding whitespace is ignored).
+	@returns Parsed invite, or None if the link is malformed.
+	"""
+	parts = urlsplit(link.strip())
+	if parts.scheme.lower() != INVITE_SCHEME:
+		return None
+
+	raw_id = text_to_key(unquote(parts.path))
+	if raw_id is None:
+		return None
+
+	names = parse_qs(parts.query).get("dn")
+	name = names[0] if names else None
+	return Invite(key_to_text(raw_id), name)
+
+
+def cell(row: list[str], column: int) -> str:
+	"""
+	Get a CSV cell, or "" if the row is shorter.
+
+	@param row Parsed CSV row.
+	@param column Column index.
+	@returns Cell text.
+	"""
+	return row[column] if len(row) > column else ""
+
+
+def check_invite(row: list[str]) -> tuple[int, str]:
+	"""
+	Check the invite column: link format, and its name against "channel".
+
+	The Hash-ID itself can not be checked against the key (the formula is
+	unknown), only its format.
+
+	@param row Parsed CSV row.
+	@returns (status, reason); reason is empty if the row is fine.
+	"""
+	link = cell(row, COL_INVITE)
+	if not link.strip():
+		return EXIT_OK, ""
+
+	invite = parse_invite(link)
+	if invite is None:
+		return EXIT_INVALID, "invite is not a dsc: link with a 52-char Hash-ID"
+
+	channel = cell(row, COL_CHANNEL)
+	if invite.name is None or not channel:
+		return EXIT_OK, ""
+
+	if invite.name != channel:
+		return (
+			EXIT_MISMATCH,
+			f"invite name {invite.name!r} differs from channel {channel!r}",
+		)
+	return EXIT_OK, ""
+
+
 def check_row(password: str, key: str) -> tuple[int, str]:
 	"""
 	Check one password against one hash.
 
 	@param password Source password.
 	@param key Expected hash (key string).
-	@returns (status, reason); reason is empty unless the row is invalid.
+	@returns (status, reason); reason is empty if the pair matches.
 	"""
 	if not password:
 		return EXIT_INVALID, "empty password"
@@ -168,7 +255,7 @@ def check_row(password: str, key: str) -> tuple[int, str]:
 		return EXIT_INVALID, f"hash is not a {KEY_CHARS}-char base32 key"
 
 	if not hmac.compare_digest(derive_key(password), expected):
-		return EXIT_MISMATCH, ""
+		return EXIT_MISMATCH, "hash does not match password"
 	return EXIT_OK, ""
 
 
@@ -235,7 +322,7 @@ def read_rows(path: str | None) -> list[tuple[int, list[str], bool]]:
 
 def report_invalid(line: int | None, reason: str) -> None:
 	"""
-	Print why a row is invalid to stderr.
+	Print why a row is not OK to stderr.
 
 	@param line Line number in the input, or None for command-line input.
 	@param reason Human-readable reason.
@@ -286,7 +373,9 @@ def cmd_encode(args: argparse.Namespace) -> int:
 
 def cmd_verify(args: argparse.Namespace) -> int:
 	"""
-	Handle "verify" for one pair or for CSV rows; channel/note are ignored.
+	Handle "verify" for one pair or for CSV rows.
+
+	Checks password against hash, then the invite column (if any).
 
 	@param args Parsed arguments.
 	@returns Worst exit code among all rows.
@@ -309,12 +398,38 @@ def cmd_verify(args: argparse.Namespace) -> int:
 		if header:
 			continue
 		password = row[COL_PASSWORD]
-		key = row[COL_HASH] if len(row) > COL_HASH else ""
+		key = cell(row, COL_HASH)
 		status, reason = check_row(password, key)
+		if status == EXIT_OK:
+			status, reason = check_invite(row)
 		if reason:
 			report_invalid(line, reason)
 		writer.writerow([STATUS_NAMES[status], password, key.strip()])
 		worst = max(worst, status)
+	return worst
+
+
+def cmd_decode(args: argparse.Namespace) -> int:
+	"""
+	Handle "decode": split invite links into "hashid;name" rows.
+
+	@param args Parsed arguments.
+	@returns EXIT_OK, or EXIT_INVALID if any link is malformed.
+	"""
+	if args.links:
+		links = [(None, link) for link in args.links]
+	else:
+		links = [(line, row[0]) for line, row, _ in read_rows(args.file)]
+
+	writer = csv_writer()
+	worst = EXIT_OK
+	for line, link in links:
+		invite = parse_invite(link)
+		if invite is None:
+			report_invalid(line, f"not a dsc: link with a 52-char Hash-ID: {link}")
+			worst = EXIT_INVALID
+			continue
+		writer.writerow([invite.hash_id, invite.name or ""])
 	return worst
 
 
@@ -327,7 +442,7 @@ def build_parser() -> argparse.ArgumentParser:
 	parser = argparse.ArgumentParser(
 		description="Derive and verify Tixati channel keys "
 		"(base32(clamp25519(SHA-256(password)))). "
-		"CSV format: password;hash;channel;note."
+		"CSV format: password;hash;channel;note;invite."
 	)
 	commands = parser.add_subparsers(dest="command", required=True)
 
@@ -345,6 +460,13 @@ def build_parser() -> argparse.ArgumentParser:
 	verify.add_argument("hash", nargs="?", help="expected hash")
 	verify.add_argument("-f", "--file", help="read CSV rows from FILE")
 	verify.set_defaults(handler=cmd_verify)
+
+	decode = commands.add_parser("decode", help="split invite links")
+	decode.add_argument(
+		"links", nargs="*", help="dsc: invite links (default: input lines)"
+	)
+	decode.add_argument("-f", "--file", help="read links from FILE")
+	decode.set_defaults(handler=cmd_decode)
 
 	return parser
 
