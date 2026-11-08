@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-Tixati channel key tool: derive keys from strings and verify string/key pairs.
+Tixati channel key tool: derive keys from passwords and verify them.
 
-Scheme (reverse-engineered from a known sample, "hashme" ->
-"aaqixfadvb67t5hnnmxoezl67ksysatljthjvtgi5cs36pljhrda"):
+Scheme (reverse-engineered from a known password/key pair):
 
-	key = base32_lower_nopad(clamp25519(SHA-256(utf8(string))))
+	key = base32_lower_nopad(clamp25519(SHA-256(utf8(password))))
+
+Example: "ApHfkCDJs8XX" -> "4chqjn3n5gj5rrf3yyjzipu52rf3hls362r27zjrxscmj5w42rka"
 
 where clamp25519 is the standard Curve25519/Ed25519 scalar clamping:
 	byte[0]  &= 0b11111000   (clear the 3 lowest bits)
@@ -14,36 +15,50 @@ where clamp25519 is the standard Curve25519/Ed25519 scalar clamping:
 
 The result is 32 bytes (a private scalar), shown as 52 base32 characters.
 
+Data format: CSV with ";" as the delimiter, columns
+	password;hash;channel;note
+"channel" and "note" are optional and never checked: "encode" copies them
+to the output unchanged, "verify" ignores them. A first row whose password
+column is "password" (any case) is treated as a header:
+"encode" copies it, "verify" skips it. Fields containing ";" or quotes use
+standard CSV quoting.
+
 Caveats:
 	- The scheme was confirmed on ASCII input only; UTF-8 is assumed for
-	  non-ASCII strings.
-	- A key derived from a short or common string is easy to brute-force
+	  non-ASCII passwords.
+	- A key derived from a short or common password is easy to brute-force
 	  with a dictionary. Use long random phrases for real channels.
 
 Usage:
-	tixati-channel-key.py encode STRING [STRING ...]
-	tixati-channel-key.py encode -f strings.txt   (prints "STRING<TAB>KEY")
-	tixati-channel-key.py verify STRING KEY
-	tixati-channel-key.py verify -f pairs.txt     (one "STRING<TAB>KEY" per line)
+	tixati-channel-key.py encode PASSWORD [PASSWORD ...]
+	tixati-channel-key.py encode -f channels.csv   (fills in the hash column)
+	tixati-channel-key.py verify PASSWORD HASH
+	tixati-channel-key.py verify -f channels.csv
+	(see tixati-channel-key.example.csv)
 	tixati-channel-key.py encode a b | tixati-channel-key.py verify
 
 	"-f FILE" works in every shell, including PowerShell, which has no "<"
-	redirection. Without "-f" and positional arguments, lines are read from
+	redirection. Without "-f" and positional arguments, CSV is read from
 	stdin. Input is always decoded as UTF-8 (a leading BOM is ignored), and
 	output is written as UTF-8, regardless of the Windows console code page.
 
+Output of "verify": one "STATUS;password;hash" row per data row, where
+STATUS is OK, MISMATCH or INVALID; reasons for INVALID go to stderr.
+
 Exit codes:
-	0 - success / all pairs match
-	1 - at least one pair does not match
-	2 - invalid input (malformed key or line)
+	0 - success / all rows match
+	1 - at least one row does not match
+	2 - invalid input (malformed hash, empty password, unreadable file)
 """
 
 import argparse
 import base64
 import binascii
+import csv
 import hashlib
 import hmac
 import sys
+from collections.abc import Iterator
 
 KEY_BYTES = 32
 KEY_CHARS = 52
@@ -51,6 +66,18 @@ KEY_CHARS = 52
 EXIT_OK = 0
 EXIT_MISMATCH = 1
 EXIT_INVALID = 2
+
+STATUS_NAMES = {
+	EXIT_OK: "OK",
+	EXIT_MISMATCH: "MISMATCH",
+	EXIT_INVALID: "INVALID",
+}
+
+DELIMITER = ";"
+COL_PASSWORD = 0
+COL_HASH = 1
+
+HEADER_NAMES = {"password"}
 
 
 def clamp25519(scalar: bytes) -> bytes:
@@ -69,9 +96,9 @@ def clamp25519(scalar: bytes) -> bytes:
 
 def derive_key(text: str) -> bytes:
 	"""
-	Derive the raw 32-byte channel key from a string.
+	Derive the raw 32-byte channel key from a password.
 
-	@param text Source string (encoded as UTF-8).
+	@param text Source password (encoded as UTF-8).
 	@returns Raw clamped key bytes.
 	"""
 	digest = hashlib.sha256(text.encode("utf-8")).digest()
@@ -114,33 +141,35 @@ def text_to_key(text: str) -> bytes | None:
 
 def encode_string(text: str) -> str:
 	"""
-	Derive the printable channel key for a string.
+	Derive the printable channel key for a password.
 
-	@param text Source string.
+	@param text Source password.
 	@returns 52-character key string.
 	"""
 	return key_to_text(derive_key(text))
 
 
-def verify_pair(text: str, key: str) -> int:
+def check_row(password: str, key: str) -> tuple[int, str]:
 	"""
-	Check one string against one key and print the verdict.
+	Check one password against one hash.
 
-	@param text Source string.
-	@param key Expected key string.
-	@returns EXIT_OK, EXIT_MISMATCH or EXIT_INVALID.
+	@param password Source password.
+	@param key Expected hash (key string).
+	@returns (status, reason); reason is empty unless the row is invalid.
 	"""
+	if not password:
+		return EXIT_INVALID, "empty password"
+
+	if not key.strip():
+		return EXIT_INVALID, "missing hash"
+
 	expected = text_to_key(key)
 	if expected is None:
-		print(f"INVALID\t{text}\t{key.strip()} (not a {KEY_CHARS}-char base32 key)")
-		return EXIT_INVALID
+		return EXIT_INVALID, f"hash is not a {KEY_CHARS}-char base32 key"
 
-	if not hmac.compare_digest(derive_key(text), expected):
-		print(f"MISMATCH\t{text}\t{key.strip()}")
-		return EXIT_MISMATCH
-
-	print(f"OK\t{text}\t{key_to_text(expected)}")
-	return EXIT_OK
+	if not hmac.compare_digest(derive_key(password), expected):
+		return EXIT_MISMATCH, ""
+	return EXIT_OK, ""
 
 
 def use_utf8_streams() -> None:
@@ -148,67 +177,144 @@ def use_utf8_streams() -> None:
 	Force UTF-8 on stdin/stdout.
 
 	On Windows, piped streams default to the ANSI code page (e.g. cp1251),
-	which would silently turn non-ASCII input into a different string and
+	which would silently turn non-ASCII input into a different password and
 	therefore a different key. "utf-8-sig" also drops a leading BOM.
 	"""
 	sys.stdin.reconfigure(encoding="utf-8-sig")
 	sys.stdout.reconfigure(encoding="utf-8")
 
 
-def read_lines(path: str | None) -> list[str]:
+def csv_writer():
 	"""
-	Read non-empty lines from a file or stdin, without trailing newlines.
+	Create a ";"-delimited CSV writer on stdout.
+
+	@returns csv writer object.
+	"""
+	return csv.writer(sys.stdout, delimiter=DELIMITER, lineterminator="\n")
+
+
+def is_header(row: list[str]) -> bool:
+	"""
+	Tell whether a row is a header (column names, not data).
+
+	@param row Parsed CSV row.
+	@returns True if the password column holds a known column name.
+	"""
+	return row[COL_PASSWORD].strip().lower() in HEADER_NAMES
+
+
+def parse_rows(lines) -> Iterator[tuple[int, list[str], bool]]:
+	"""
+	Parse ";"-delimited CSV, skipping empty rows.
+
+	@param lines Iterable of text lines (file or stdin).
+	@returns Iterator of (line number, row, is header) tuples.
+	"""
+	reader = csv.reader(lines, delimiter=DELIMITER)
+	first = True
+	for row in reader:
+		if not any(field.strip() for field in row):
+			continue
+		yield reader.line_num, row, first and is_header(row)
+		first = False
+
+
+def read_rows(path: str | None) -> list[tuple[int, list[str], bool]]:
+	"""
+	Read CSV rows from a file or stdin.
 
 	@param path File to read, or None for stdin.
-	@returns List of lines.
+	@returns List of (line number, row, is header) tuples.
 	"""
 	if path is None:
-		return [line.rstrip("\r\n") for line in sys.stdin if line.strip()]
+		return list(parse_rows(sys.stdin))
 
-	with open(path, encoding="utf-8-sig") as source:
-		return [line.rstrip("\r\n") for line in source if line.strip()]
+	with open(path, encoding="utf-8-sig", newline="") as source:
+		return list(parse_rows(source))
+
+
+def report_invalid(line: int | None, reason: str) -> None:
+	"""
+	Print why a row is invalid to stderr.
+
+	@param line Line number in the input, or None for command-line input.
+	@param reason Human-readable reason.
+	"""
+	where = f"line {line}: " if line is not None else ""
+	print(f"{where}{reason}", file=sys.stderr)
+
+
+def fill_hash(row: list[str]) -> list[str]:
+	"""
+	Return a copy of a row with the hash column set from the password.
+
+	@param row Parsed CSV row (password first).
+	@returns Row with at least two columns; extra columns kept as is.
+	"""
+	filled = list(row) + [""] * (COL_HASH + 1 - len(row))
+	filled[COL_HASH] = encode_string(row[COL_PASSWORD])
+	return filled
 
 
 def cmd_encode(args: argparse.Namespace) -> int:
 	"""
-	Handle the "encode" command: print "STRING<TAB>KEY" per input string.
+	Handle "encode": print "password;hash[;channel;note]" rows.
 
-	The output format matches what "verify" reads from stdin.
+	The output format matches what "verify" reads.
 
 	@param args Parsed arguments.
 	@returns Exit code.
 	"""
-	strings = args.strings or read_lines(args.file)
-	for text in strings:
-		print(f"{text}\t{encode_string(text)}")
-	return EXIT_OK
+	if args.passwords:
+		rows = [(None, [password], False) for password in args.passwords]
+	else:
+		rows = read_rows(args.file)
+
+	writer = csv_writer()
+	worst = EXIT_OK
+	for line, row, header in rows:
+		if header:
+			writer.writerow(row)
+			continue
+		if not row[COL_PASSWORD]:
+			report_invalid(line, "empty password")
+			worst = EXIT_INVALID
+			continue
+		writer.writerow(fill_hash(row))
+	return worst
 
 
 def cmd_verify(args: argparse.Namespace) -> int:
 	"""
-	Handle the "verify" command for one pair or for pairs from stdin.
+	Handle "verify" for one pair or for CSV rows; channel/note are ignored.
 
 	@param args Parsed arguments.
-	@returns Worst exit code among all pairs.
+	@returns Worst exit code among all rows.
 	"""
-	if args.string is not None and args.file is not None:
-		print("verify: use either STRING KEY or -f FILE", file=sys.stderr)
+	if args.password is not None and args.file is not None:
+		print("verify: use either PASSWORD HASH or -f FILE", file=sys.stderr)
 		return EXIT_INVALID
 
-	if args.string is not None:
-		if args.key is None:
-			print("verify: KEY is required when STRING is given", file=sys.stderr)
+	if args.password is not None:
+		if args.hash is None:
+			print("verify: HASH is required with PASSWORD", file=sys.stderr)
 			return EXIT_INVALID
-		return verify_pair(args.string, args.key)
+		rows = [(None, [args.password, args.hash], False)]
+	else:
+		rows = read_rows(args.file)
 
+	writer = csv_writer()
 	worst = EXIT_OK
-	for line in read_lines(args.file):
-		text, sep, key = line.rpartition("\t")
-		if not sep:
-			print(f"INVALID\t{line} (expected STRING<TAB>KEY)")
-			worst = max(worst, EXIT_INVALID)
+	for line, row, header in rows:
+		if header:
 			continue
-		worst = max(worst, verify_pair(text, key))
+		password = row[COL_PASSWORD]
+		key = row[COL_HASH] if len(row) > COL_HASH else ""
+		status, reason = check_row(password, key)
+		if reason:
+			report_invalid(line, reason)
+		writer.writerow([STATUS_NAMES[status], password, key.strip()])
+		worst = max(worst, status)
 	return worst
 
 
@@ -220,25 +326,24 @@ def build_parser() -> argparse.ArgumentParser:
 	"""
 	parser = argparse.ArgumentParser(
 		description="Derive and verify Tixati channel keys "
-		"(base32(clamp25519(SHA-256(string))))."
+		"(base32(clamp25519(SHA-256(password)))). "
+		"CSV format: password;hash;channel;note."
 	)
 	commands = parser.add_subparsers(dest="command", required=True)
 
-	encode = commands.add_parser("encode", help="derive keys from strings")
+	encode = commands.add_parser("encode", help="derive hashes from passwords")
 	encode.add_argument(
-		"strings", nargs="*", help="strings to encode (default: stdin lines)"
+		"passwords", nargs="*", help="passwords to encode (default: CSV input)"
 	)
 	encode.add_argument(
-		"-f", "--file", help="read strings from FILE, one per line"
+		"-f", "--file", help="read CSV from FILE and fill in the hash column"
 	)
 	encode.set_defaults(handler=cmd_encode)
 
-	verify = commands.add_parser("verify", help="check strings against keys")
-	verify.add_argument("string", nargs="?", help="source string")
-	verify.add_argument("key", nargs="?", help="expected key")
-	verify.add_argument(
-		"-f", "--file", help="read STRING<TAB>KEY pairs from FILE"
-	)
+	verify = commands.add_parser("verify", help="check passwords against hashes")
+	verify.add_argument("password", nargs="?", help="source password")
+	verify.add_argument("hash", nargs="?", help="expected hash")
+	verify.add_argument("-f", "--file", help="read CSV rows from FILE")
 	verify.set_defaults(handler=cmd_verify)
 
 	return parser
@@ -254,7 +359,13 @@ def main() -> int:
 	args = build_parser().parse_args()
 	try:
 		return args.handler(args)
-	except OSError as error:
+	except UnicodeDecodeError:
+		print(
+			"cannot read input: not UTF-8 (in Excel, save as \"CSV UTF-8\")",
+			file=sys.stderr,
+		)
+		return EXIT_INVALID
+	except (OSError, csv.Error) as error:
 		print(f"cannot read input: {error}", file=sys.stderr)
 		return EXIT_INVALID
 
