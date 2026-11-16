@@ -11,8 +11,10 @@
 ::      hand from the Telegram channel, which the script opens.
 ::   2. Checks, while the phone runs stock HyperOS: product, stock version
 ::      (the guide asks for Global 2.0.209 or India 2.0.207), then in
-::      fastboot: product again, an unlocked bootloader, and that slot b
-::      has booted before (the ROM needs stock firmware in both slots).
+::      fastboot: product again, an unlocked bootloader, that slot b has
+::      booted before (the ROM needs stock firmware in both slots), and the
+::      anti-rollback index ("fastboot getvar anti"), which is only shown:
+::      2 means India firmware was installed once and can never be undone.
 ::   3. Fastboot: boot, recovery to vendor_boot, md1img, reboot to recovery.
 ::      Since the 18.10.2026 recovery, boot is required: the recovery uses
 ::      the kernel from it and bootloops on the stock one.
@@ -72,6 +74,11 @@ IF DEFINED CRDROID_ALLOW_PRODUCT SET "PRODUCT_OK_%CRDROID_ALLOW_PRODUCT%=1"
 :: Lookup table: stock HyperOS version -> accepted (from the guide).
 SET "BASE_OK_OS2.0.209.0.VMXMIXM=1"
 SET "BASE_OK_OS2.0.207.0.VMXINXM=1"
+
+:: Lookup table: anti-rollback index -> what it means. On the Redmi 12 only
+:: India firmware raises it; see the support chat's notes.
+SET "ARB_NOTE_1=not raised: no India firmware so far"
+SET "ARB_NOTE_2=raised by India firmware: no older or other-region stock"
 
 :: Lookup table: command -> Scoop package that provides it.
 SET "SCOOP_PKG_adb=adb"
@@ -408,8 +415,11 @@ EXIT /B 1
   CALL :Getvar product PRODUCT
   CALL :Getvar unlocked UNLOCKED
   CALL :Getvar slot-successful:b SLOT_B
+  CALL :Getvar anti ARB
   ECHO   product "%PRODUCT%", unlocked "%UNLOCKED%", slot b booted "%SLOT_B%"
+  CALL :ShowArb
   CALL :Log "Bootloader: %PRODUCT%, unlocked %UNLOCKED%, slot b %SLOT_B%"
+  CALL :Log "Anti-rollback: %ARB%"
 
   CALL :CheckProduct
   IF ERRORLEVEL 1 EXIT /B 2
@@ -430,6 +440,19 @@ EXIT /B 1
   ECHO        do: ask the maintainer first. CRDROID_ALLOW_SLOT_B=1 skips 1>&2
   ECHO        this check. Reboot the phone with: fastboot reboot 1>&2
 EXIT /B 2
+
+
+:: -----------------------------------------------------------------------------
+:: ShowArb
+:: Prints the anti-rollback index ARB and its meaning from the lookup table.
+:: -----------------------------------------------------------------------------
+:ShowArb
+  SET "ARB_NOTE="
+  IF DEFINED ARB CALL SET "ARB_NOTE=%%ARB_NOTE_%ARB%%%"
+  IF NOT DEFINED ARB_NOTE SET "ARB_NOTE=unknown: ask before flashing stock"
+  IF NOT DEFINED ARB SET "ARB=not reported"
+  ECHO   anti-rollback %ARB%: %ARB_NOTE%
+EXIT /B
 
 
 :: =============================================================================

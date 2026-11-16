@@ -14,6 +14,10 @@
 :: It does NOT tell which firmware version is there: ask the ROM maintainer
 :: when in doubt.
 ::
+:: Also prints the anti-rollback index ("fastboot getvar anti"). On the
+:: Redmi 12 only India firmware raises it to 2, and then no older or
+:: other-region stock firmware may be flashed again: it hard-bricks to BROM.
+::
 :: Nothing is written to the phone: only "fastboot getvar" is used.
 ::
 :: If no phone is in fastboot mode but one is booted with USB debugging on,
@@ -53,6 +57,10 @@ SET "FASTBOOT_WAIT=60"
 :: Set once this script has put the phone into fastboot mode.
 SET "REBOOTED="
 
+:: Lookup table: anti-rollback index -> what it means (Redmi 12 values).
+SET "ARB_1=not raised"
+SET "ARB_2=raised, e.g. by India firmware: flash no older or other-region stock"
+
 :: Lookup table: "<successful>-<unbootable>" -> what it means for a slot.
 :: "?" stands for a value the bootloader does not report.
 SET "V_yes-no=has booted before: most likely holds working firmware"
@@ -89,12 +97,17 @@ IF %READY% GTR 1 IF NOT DEFINED ANDROID_SERIAL (
 CALL :getvar product PRODUCT
 CALL :getvar unlocked UNLOCKED
 CALL :getvar current-slot CURRENT
+CALL :getvar anti ARB
+SET "ARB_TEXT="
+CALL SET "ARB_TEXT=%%ARB_%ARB%%%"
+IF NOT DEFINED ARB_TEXT SET "ARB_TEXT=not reported or unknown on this phone"
 :: Some bootloaders answer "_a" instead of "a".
 SET "CURRENT=%CURRENT:_=%"
 
 ECHO Product:      %PRODUCT%
 ECHO Unlocked:     %UNLOCKED%
 ECHO Current slot: %CURRENT%
+ECHO Anti-rollback: %ARB%, %ARB_TEXT%
 
 IF DEFINED EXPECTED IF /I NOT "%PRODUCT%"=="%EXPECTED%" (
   ECHO Warning: expected "%EXPECTED%", the phone says "%PRODUCT%". 1>&2
