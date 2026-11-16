@@ -68,6 +68,8 @@ SET "V_no-no=never marked as booted: may be empty or not tried yet"
 SET "V_no-yes=marked unbootable: likely empty or broken"
 SET "V_yes-yes=booted before, but is marked unbootable now"
 
+CALL :intro
+
 :: Guard: fastboot must be available.
 WHERE fastboot >NUL 2>&1
 IF ERRORLEVEL 1 (
@@ -146,6 +148,24 @@ ECHO This window closes in %FAIL_WAIT% s, press any key to close it now. 1>&2
 :: TIMEOUT refuses redirected stdin; then it just returns at once.
 TIMEOUT /T %FAIL_WAIT% >NUL 2>&1
 EXIT /B %RC%
+
+:: -----------------------------------------------------------------------------
+:: intro
+:: Says what the script does and waits until the phone is connected.
+:: -----------------------------------------------------------------------------
+:intro
+ECHO Checks the A/B slots of an Android phone, read-only: product, lock
+ECHO state, anti-rollback index, current slot, and whether each slot has
+ECHO booted before. Nothing is written to the phone.
+ECHO.
+ECHO Connect the phone to this PC with a USB cable, either
+ECHO   - started normally, with USB debugging on ^(Developer options^): it is
+ECHO     rebooted to fastboot and back to the system by itself, or
+ECHO   - already in fastboot mode ^(Power + Volume down^).
+ECHO.
+PAUSE
+ECHO.
+GOTO :EOF
 
 :: -----------------------------------------------------------------------------
 :: parse_arg "<arg>"
