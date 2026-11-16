@@ -5,15 +5,17 @@
 :: Installs crDroid (Android 16) on a Xiaomi Redmi 12 4G ("fire") the way the
 :: maintainer's guide in the support chat describes it:
 ::
-::   1. Files: finds the crDroid ROM zip, its recovery image and its modem
-::      image (md1img) next to the script or in Downloads (also in
+::   1. Files: finds the crDroid ROM zip, its boot image, recovery image and
+::      modem image (md1img) next to the script or in Downloads (also in
 ::      "Downloads\Telegram Desktop"). Missing ones are to be downloaded by
 ::      hand from the Telegram channel, which the script opens.
 ::   2. Checks, while the phone runs stock HyperOS: product, stock version
 ::      (the guide asks for Global 2.0.209 or India 2.0.207), then in
 ::      fastboot: product again, an unlocked bootloader, and that slot b
 ::      has booted before (the ROM needs stock firmware in both slots).
-::   3. Fastboot: recovery to vendor_boot, md1img, reboot to recovery.
+::   3. Fastboot: boot, recovery to vendor_boot, md1img, reboot to recovery.
+::      Since the 18.10.2026 recovery, boot is required: the recovery uses
+::      the kernel from it and bootloops on the stock one.
 ::   4. Recovery: you format data and choose Apply from ADB on the phone;
 ::      the script waits for sideload mode and sends the ROM, then GApps.
 ::
@@ -50,6 +52,7 @@ SET "SCRIPT_DIR=%~dp0"
 SET "LOG_DIR=%~dp0logs"
 :: File masks; when several files match, the newest one is taken.
 SET "MASK_ROM=crDroidAndroid-*-fire-*.zip"
+SET "MASK_BOOT=boot*.img"
 SET "MASK_REC1=recovery*.img"
 SET "MASK_REC2=vendor_boot*.img"
 SET "MASK_MD1=md1img*.img"
@@ -180,15 +183,17 @@ EXIT /B
 
 :: -----------------------------------------------------------------------------
 :: StageFiles
-:: Finds ROM, recovery, md1img and (optional) GApps; until all required ones
-:: are there, opens the channel and offers to look again. Then shows them,
-:: checks the ROM's .sha256 if there is one, and asks to go on.
+:: Finds ROM, boot, recovery, md1img and (optional) GApps; until all
+:: required ones are there, opens the channel and offers to look again.
+:: Then shows them, checks the ROM's .sha256 if there is one, and asks to
+:: go on.
 :: @returns 0 when ready, 3 if a file is broken, 5 if cancelled
 :: -----------------------------------------------------------------------------
 :StageFiles
   CALL :FindDownloads
 :StageFiles_find
   CALL :FindFile "%MASK_ROM%" ROM
+  CALL :FindFile "%MASK_BOOT%" BOOT
   CALL :FindFile "%MASK_REC1%" REC
   IF NOT DEFINED REC CALL :FindFile "%MASK_REC2%" REC
   CALL :FindFile "%MASK_MD1%" MD1
@@ -196,13 +201,14 @@ EXIT /B
 
   SET "LACK="
   IF NOT DEFINED ROM SET "LACK=%LACK% %MASK_ROM%"
+  IF NOT DEFINED BOOT SET "LACK=%LACK% %MASK_BOOT%"
   IF NOT DEFINED REC SET "LACK=%LACK% %MASK_REC1%"
   IF NOT DEFINED MD1 SET "LACK=%LACK% %MASK_MD1%"
   IF NOT DEFINED LACK GOTO :StageFiles_show
 
   ECHO Not found:%LACK%
   ECHO Looked in: "%SCRIPT_DIR%", "%DL%\Telegram Desktop", "%DL%".
-  ECHO Download the ROM, recovery and md1img of ONE release from
+  ECHO Download the ROM, boot, recovery and md1img of ONE release from
   ECHO   %CHANNEL%
   ECHO ^(opening it now^), then come back here.
   IF NOT DEFINED DRY_RUN START "" "%CHANNEL%"
@@ -213,12 +219,14 @@ EXIT /B
 :StageFiles_show
   ECHO Files:
   CALL :ShowFile "ROM     " "%ROM%"
+  CALL :ShowFile "Boot    " "%BOOT%"
   CALL :ShowFile "Recovery" "%REC%"
   CALL :ShowFile "md1img  " "%MD1%"
   IF DEFINED GAPPS (CALL :ShowFile "GApps   " "%GAPPS%") ELSE (
     ECHO   GApps    none found, the ROM is installed without Google apps
   )
   CALL :Log "ROM %ROM%"
+  CALL :Log "Boot %BOOT%"
   CALL :Log "Recovery %REC%"
   CALL :Log "md1img %MD1%"
   CALL :Log "GApps %GAPPS%"
@@ -227,7 +235,8 @@ EXIT /B
   IF ERRORLEVEL 1 EXIT /B 3
 
   ECHO.
-  ECHO Recovery and md1img must come from the same release as the ROM:
+  ECHO Boot, recovery and md1img must come from the same release as the
+  ECHO ROM, or the recovery bootloops:
   ECHO compare the names and dates above with the channel's post.
   CHOICE /C YN /N /M "Are these the right files? (Y/N) "
   IF NOT "%ERRORLEVEL%"=="1" EXIT /B 5
@@ -429,14 +438,17 @@ EXIT /B 2
 
 :: -----------------------------------------------------------------------------
 :: StageFastboot
-:: Flashes recovery to vendor_boot and the modem image, then boots recovery.
+:: Flashes boot, recovery to vendor_boot and the modem image, then boots
+:: recovery.
 :: @returns 0 on success, 4 if fastboot failed, 5 if cancelled
 :: -----------------------------------------------------------------------------
 :StageFastboot
   ECHO.
-  ECHO Next: recovery to vendor_boot, md1img, then reboot to recovery.
-  CALL :Confirm "Flash recovery and md1img now?"
+  ECHO Next: boot, recovery to vendor_boot, md1img, then reboot to recovery.
+  CALL :Confirm "Flash boot, recovery and md1img now?"
   IF ERRORLEVEL 1 EXIT /B 5
+  CALL :Flash flash boot "%BOOT%"
+  IF ERRORLEVEL 1 EXIT /B 4
   CALL :Flash flash vendor_boot "%REC%"
   IF ERRORLEVEL 1 EXIT /B 4
   CALL :Flash flash md1img "%MD1%"
@@ -733,8 +745,8 @@ EXIT /B
 
 :usage
 ECHO Installs crDroid on a Redmi 12 4G ^(fire^) by the support chat's guide:
-ECHO checks the phone, flashes recovery and md1img, then sideloads the ROM
-ECHO and GApps. Files are looked for next to the script and in Downloads.
+ECHO checks the phone, flashes boot, recovery and md1img, then sideloads the
+ECHO ROM and GApps. Files are looked for next to the script and in Downloads.
 ECHO.
 ECHO   %~nx0          check, then flash
 ECHO   %~nx0 /dry     print the commands, change nothing
