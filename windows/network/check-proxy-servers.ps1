@@ -64,6 +64,8 @@
   Many VPS providers drop ICMP, so a failed ping alone does not mean the host is down.
   An open port 443 only proves that something accepts TCP there, not that the proxy core works.
 #>
+[Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingWriteHost', '', Justification = 'Interactive tool: the colored console table is its output.')]
+[Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'New-Check only builds a result object, it changes no state.')]
 [CmdletBinding()]
 param(
   [Parameter(Position = 0, ValueFromRemainingArguments)]
@@ -145,7 +147,7 @@ function Get-ShortError {
 .OUTPUTS
   Lines of the file.
 #>
-function Read-TextLines {
+function Read-TextFile {
   param([string] $Path)
   $fullPath = (Resolve-Path -LiteralPath $Path).ProviderPath
   $strictUtf8 = [System.Text.UTF8Encoding]::new($false, $true)
@@ -186,7 +188,7 @@ function Get-ServerList {
     if (-not (Test-Path -LiteralPath $FilePath -PathType Leaf)) {
       throw "List file not found: $FilePath"
     }
-    foreach ($line in Read-TextLines -Path $FilePath) {
+    foreach ($line in Read-TextFile -Path $FilePath) {
       $line = ($line -replace '#.*$', '').Trim()
       if ($line -match '^\[(?<name>.+)\]$') {
         # Section names may contain spaces, so they are not split
