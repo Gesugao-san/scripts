@@ -129,3 +129,5 @@ pairs.txt
 ### windows/network/check-proxy-servers.ps1 ###
 # Real server list (IP addresses of own proxies)
 windows/network/servers.txt
+# Saved runs (plain-text tables)
+windows/network/results/

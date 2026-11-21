@@ -40,6 +40,9 @@
   Without -Proxy the probes use this machine's normal route (router, podkop, system proxy);
   with -Proxy they go through the given HTTP proxy. Redirects are not followed.
 
+  Every run is also saved as plain text (the same table, without colors) to
+  results\<yyyy-MM-dd_HH-mm-ss>.txt next to the script, or to -OutDir; -NoSave turns that off.
+
   Servers are given as groups of IP addresses and domain names (anything that is not
   an IP address is treated as a domain name to check):
     - in arguments: name=ip1,ip2,domain or name=ip1 ip2 domain; entries after a name belong
@@ -122,6 +125,12 @@
 .EXAMPLE
   .\check-proxy-servers.ps1 -ListFile .\servers.txt -Probe google,amazon-ip,cloudflare-trace -Proxy http://127.0.0.1:2080
 
+.PARAMETER OutDir
+  Folder for the saved results. Default: the results folder next to this script.
+
+.PARAMETER NoSave
+  Do not save the results to a file.
+
 .NOTES
   Exit code: 0 when nothing failed (yellow is not a failure), 1 when any check failed,
   2 when nothing to check was given or the options do not fit together.
@@ -174,7 +183,11 @@ param(
   [ValidateRange(1, 300)]
   [int] $HttpTimeoutSec = 10,
 
-  [string] $Proxy
+  [string] $Proxy,
+
+  [string] $OutDir,
+
+  [switch] $NoSave
 )
 
 Set-StrictMode -Version Latest
@@ -1154,17 +1167,65 @@ function Invoke-ConnectivityProbe {
 #>
 function Write-Row {
   param([object[]] $Cells)
+  $line = ''
   foreach ($cell in $Cells) {
     $text = [string] $cell.Text
     if ($text.Length -gt $cell.Width) {
       $text = $text.Substring(0, $cell.Width)
     }
-    Write-Host ($text.PadRight($cell.Width) + '  ') -NoNewline -ForegroundColor $cell.Color
+    $text = $text.PadRight($cell.Width) + '  '
+    Write-Host $text -NoNewline -ForegroundColor $cell.Color
+    $line += $text
   }
   Write-Host ''
+  $Report.Add($line.TrimEnd())
+}
+
+<#
+.SYNOPSIS
+  Prints a colored line and keeps it, without color, for the saved results.
+#>
+function Write-ReportLine {
+  param(
+    [string] $Text,
+    [string] $Color = 'Gray'
+  )
+  Write-Host $Text -ForegroundColor $Color
+  $Report.Add($Text)
+}
+
+<#
+.SYNOPSIS
+  Saves the kept lines as a UTF-8 text file named after the start time; prints where.
+.DESCRIPTION
+  The file has a BOM so that Notepad and Windows PowerShell 5.1 read Cyrillic server
+  names correctly. A failed save is reported but does not change the exit code.
+.PARAMETER Folder
+  Target folder; created when missing.
+.PARAMETER Started
+  Start time of the run, used for the file name.
+#>
+function Save-Report {
+  param(
+    [string] $Folder,
+    [datetime] $Started
+  )
+  try {
+    $null = New-Item -ItemType Directory -Path $Folder -Force
+    $path = Join-Path (Resolve-Path -LiteralPath $Folder).ProviderPath ($Started.ToString('yyyy-MM-dd_HH-mm-ss') + '.txt')
+    [System.IO.File]::WriteAllLines($path, [string[]] $Report, [System.Text.UTF8Encoding]::new($true))
+    Write-Host "Saved: $path" -ForegroundColor DarkGray
+  } catch {
+    Write-Host "Could not save the results: $($_.Exception.Message)" -ForegroundColor Yellow
+  }
 }
 
 # --- Main -------------------------------------------------------------------
+
+# Lines of the table without colors, saved at the end (see Save-Report)
+$Report = [System.Collections.Generic.List[string]]::new()
+$started = Get-Date
+$resultsFolder = if ($OutDir) { $OutDir } else { Join-Path $PSScriptRoot 'results' }
 
 $servers = @(Get-ServerList -Inline $Ip -FilePath $ListFile)
 if ($servers.Count -eq 0) {
@@ -1178,6 +1239,9 @@ try {
   Write-Host $_.Exception.Message -ForegroundColor Red
   exit 2
 }
+
+$source = if ($ListFile) { $ListFile } else { 'arguments' }
+$Report.Add("check-proxy-servers $($started.ToString('yyyy-MM-dd HH:mm:ss zzz')), $([Environment]::MachineName), servers from $source")
 
 $hasDomains = @($servers | Where-Object { $_.Domains.Count -gt 0 }).Count -gt 0
 $resolverName = $null
@@ -1194,7 +1258,7 @@ if ($hasDomains) {
   }
   $via = if ($DnsServer) { $DnsServer } else { 'system DNS' }
   $with = if ($resolverName) { $resolverName } else { 'no resolver found' }
-  Write-Host "Domains: $with, via $via" -ForegroundColor DarkGray
+  Write-ReportLine "Domains: $with, via $via" 'DarkGray'
 }
 
 $entries = @($servers | ForEach-Object { @($_.Addresses) + @($_.Domains) })
@@ -1217,7 +1281,7 @@ $totalChecks = 0
 $failedChecks = 0
 $sawFakeIp = $false
 foreach ($server in $servers) {
-  Write-Host $separator -ForegroundColor DarkGray
+  Write-ReportLine $separator 'DarkGray'
   $label = $server.Name
 
   foreach ($address in $server.Addresses) {
@@ -1253,11 +1317,12 @@ foreach ($server in $servers) {
     if (@($dns.Answers | Where-Object { Test-FakeIp $_.Address }).Count -gt 0) { $sawFakeIp = $true }
 
     $tlsCells = @()
-    if (-not $NoTls) {
+    # Without DNS answers a TLS check by name would only repeat the DNS failure
+    if (-not $NoTls -and $dns.Answers.Count -gt 0) {
       # Prefer an address of this server, so the check shows what the server itself presents
       $own = @($dns.Answers | Where-Object { $_.Level -eq 'Ok' } | ForEach-Object { $_.Address })
       $any = @($dns.Answers | ForEach-Object { $_.Address })
-      $target = @($own + $any + $domain)[0]
+      $target = @($own + $any)[0]
       $tls = Test-TlsHandshake -Target $target -Port $TlsPort -ServerName $domain -Timeout $TimeoutMs
       $totalChecks++
       if ($tls.Level -eq 'Fail') { $failedChecks++ }
@@ -1277,15 +1342,15 @@ foreach ($server in $servers) {
     $label = ''
   }
 }
-Write-Host $separator -ForegroundColor DarkGray
+Write-ReportLine $separator 'DarkGray'
 
 if ($sawFakeIp) {
-  Write-Host 'Yellow addresses are in 198.18.0.0/15, likely FakeIP from podkop/sing-box: try -DnsServer 1.1.1.1' -ForegroundColor Yellow
+  Write-ReportLine 'Yellow addresses are in 198.18.0.0/15, likely FakeIP from podkop/sing-box: try -DnsServer 1.1.1.1' 'Yellow'
 }
 
 if ($probes.Count -gt 0) {
   $route = if ($Proxy) { "via $Proxy" } else { 'default route' }
-  Write-Host "Probes ($route)" -ForegroundColor White
+  Write-ReportLine "Probes ($route)" 'White'
   $exitIpOwners = @{}
   foreach ($server in $servers) {
     foreach ($address in $server.Addresses) {
@@ -1304,10 +1369,10 @@ if ($probes.Count -gt 0) {
   }
 }
 
-if ($failedChecks -gt 0) {
-  Write-Host "$failedChecks of $totalChecks checks failed" -ForegroundColor Red
-  exit 1
+$summary = @{ $true = @("$failedChecks of $totalChecks checks failed", 'Red', 1); $false = @("All $totalChecks checks passed", 'Green', 0) }[$failedChecks -gt 0]
+Write-ReportLine $summary[0] $summary[1]
+if (-not $NoSave) {
+  Save-Report -Folder $resultsFolder -Started $started
 }
-Write-Host "All $totalChecks checks passed" -ForegroundColor Green
-exit 0
+exit $summary[2]
 
