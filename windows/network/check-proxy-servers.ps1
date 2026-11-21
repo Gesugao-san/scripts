@@ -1,7 +1,7 @@
 #!/usr/bin/env pwsh
 <#
 .SYNOPSIS
-  Quick health check of proxy servers: ping, TCP ports, DNS records and a generate_204 probe.
+  Quick health check of proxy servers: ping, TCP ports, DNS records and connectivity probes.
 
 .DESCRIPTION
   Checks every address of every server and prints one colored table,
@@ -22,9 +22,16 @@
   see -DnsServer). Without doggo the script offers to install it with Scoop, then falls back
   to Resolve-DnsName (Windows), dig or nslookup, whichever is found first.
 
-  After the table, requests -ProbeUrl (Google generate_204) once, expecting HTTP 204.
-  Without -Proxy the probe uses this machine's normal route (router, podkop, etc.);
-  with -Proxy the request goes through the given HTTP proxy.
+  After the table, sends all connectivity probes at once and prints one line per probe:
+    - captive-portal checks of Google, Cloudflare, Microsoft, Apple, Mozilla, GNOME, Debian
+      and Ubuntu: each expects its own status code and, for some, its own text, so a
+      redirect, a DPI stub page or a blocked host shows up as a red line;
+    - exit IP services (Amazon, ipify, icanhazip, Cloudflare trace): they show the public
+      address the request left from, marked "= <server>" when it is one of the servers
+      from the list, so you can see which proxy (if any) the route goes through.
+  -Probe picks some of them, -ProbeUrl adds own generate_204-style URLs, -NoProbe skips them.
+  Without -Proxy the probes use this machine's normal route (router, podkop, system proxy);
+  with -Proxy they go through the given HTTP proxy. Redirects are not followed.
 
   Servers are given as groups of IP addresses and domain names (anything that is not
   an IP address is treated as a domain name to check):
@@ -65,14 +72,20 @@
 .PARAMETER NoInstallPrompt
   Do not offer to install doggo when it is missing; just fall back to another resolver.
 
+.PARAMETER Probe
+  Names of the connectivity probes to run (see $ProbeCatalog in the script). Default: all.
+
 .PARAMETER ProbeUrl
-  URL for the final HTTP check. Default: https://www.google.com/generate_204.
+  Extra probe URLs of your own, each expected to answer HTTP 204.
+
+.PARAMETER NoProbe
+  Skip the connectivity probes.
 
 .PARAMETER HttpTimeoutSec
-  Timeout for the final HTTP check, in seconds. Default: 10.
+  Timeout for each connectivity probe, in seconds. Default: 10.
 
 .PARAMETER Proxy
-  Optional HTTP proxy for the final check, e.g. http://127.0.0.1:2080.
+  Optional HTTP proxy for the connectivity probes, e.g. http://127.0.0.1:2080.
 
 .EXAMPLE
   .\check-proxy-servers.ps1 -ListFile .\servers.txt
@@ -85,6 +98,9 @@
 
 .EXAMPLE
   .\check-proxy-servers.ps1 -ListFile .\servers.txt -PingCount 2 -TimeoutMs 1500 -Ports 22,443,8443
+
+.EXAMPLE
+  .\check-proxy-servers.ps1 -ListFile .\servers.txt -Probe google,amazon-ip,cloudflare-trace -Proxy http://127.0.0.1:2080
 
 .NOTES
   Exit code: 0 when nothing failed (yellow is not a failure), 1 when any check failed,
@@ -122,7 +138,11 @@ param(
 
   [switch] $NoInstallPrompt,
 
-  [string] $ProbeUrl = 'https://www.google.com/generate_204',
+  [string[]] $Probe,
+
+  [string[]] $ProbeUrl,
+
+  [switch] $NoProbe,
 
   [ValidateRange(1, 300)]
   [int] $HttpTimeoutSec = 10,
@@ -157,6 +177,27 @@ $CellWidth = 11
 
 # Longest error text shown in a domain row
 $MaxErrorLength = 60
+
+# Connectivity probes: name -> URL, expected status, optional body pattern and the function
+# that reads the answer. The captive-portal URLs are the ones OSes and browsers use themselves;
+# several are plain HTTP on purpose, as there a captive portal or DPI can tamper with them.
+$ProbeCatalog = [ordered]@{
+  'google'           = @{ Url = 'https://www.google.com/generate_204'; Status = 204; Reader = 'Read-StatusProbe' }
+  'gstatic'          = @{ Url = 'http://connectivitycheck.gstatic.com/generate_204'; Status = 204; Reader = 'Read-StatusProbe' }
+  'cloudflare'       = @{ Url = 'https://cp.cloudflare.com/generate_204'; Status = 204; Reader = 'Read-StatusProbe' }
+  'edge'             = @{ Url = 'http://edge-http.microsoft.com/captiveportal/generate_204'; Status = 204; Reader = 'Read-StatusProbe' }
+  'windows'          = @{ Url = 'http://www.msftconnecttest.com/connecttest.txt'; Status = 200; Body = '^Microsoft Connect Test$'; Reader = 'Read-StatusProbe' }
+  'apple'            = @{ Url = 'http://captive.apple.com/hotspot-detect.html'; Status = 200; Body = '(?<=<TITLE>)Success(?=</TITLE>)'; Reader = 'Read-StatusProbe' }
+  'firefox'          = @{ Url = 'http://detectportal.firefox.com/success.txt'; Status = 200; Body = '^success$'; Reader = 'Read-StatusProbe' }
+  'firefox-204'      = @{ Url = 'http://firefox-portal-detection.com/generate_204'; Status = 204; Reader = 'Read-StatusProbe' }
+  'gnome'            = @{ Url = 'https://nmcheck.gnome.org/check_network_status.txt'; Status = 200; Body = '^NetworkManager is online$'; Reader = 'Read-StatusProbe' }
+  'debian'           = @{ Url = 'http://network-test.debian.org/nm'; Status = 200; Body = '^NetworkManager is online$'; Reader = 'Read-StatusProbe' }
+  'ubuntu'           = @{ Url = 'http://connectivity-check.ubuntu.com/'; Status = 204; Reader = 'Read-StatusProbe' }
+  'amazon-ip'        = @{ Url = 'https://checkip.amazonaws.com/'; Status = 200; Reader = 'Read-ExitIpProbe' }
+  'ipify'            = @{ Url = 'https://api.ipify.org/'; Status = 200; Reader = 'Read-ExitIpProbe' }
+  'icanhazip'        = @{ Url = 'https://icanhazip.com/'; Status = 200; Reader = 'Read-ExitIpProbe' }
+  'cloudflare-trace' = @{ Url = 'https://www.cloudflare.com/cdn-cgi/trace'; Status = 200; Reader = 'Read-TraceProbe' }
+}
 
 <#
 .SYNOPSIS
@@ -729,44 +770,232 @@ function Test-DomainRecord {
 
 <#
 .SYNOPSIS
-  Requests a generate_204-style URL and expects HTTP 204.
-.PARAMETER Url
-  URL to request.
-.PARAMETER TimeoutSec
-  Request timeout, in seconds.
-.PARAMETER ProxyUrl
-  Optional HTTP proxy.
+  Builds the list of connectivity probes to run.
+.PARAMETER Names
+  Probe names from $ProbeCatalog; empty means all of them.
+.PARAMETER ExtraUrls
+  Own URLs, each expected to answer HTTP 204.
+.PARAMETER Skip
+  Return no probes at all.
+.OUTPUTS
+  Objects with Name, Url, Status, Body and Reader; throws on an unknown name.
 #>
-function Test-Generate204 {
+function Get-ProbeList {
   param(
-    [string] $Url,
-    [int] $TimeoutSec,
-    [string] $ProxyUrl
+    [string[]] $Names,
+    [string[]] $ExtraUrls,
+    [switch] $Skip
   )
-  $request = @{
-    Uri                = $Url
-    UseBasicParsing    = $true
-    TimeoutSec         = $TimeoutSec
-    MaximumRedirection = 0
+  if ($Skip) {
+    return
   }
+  $selected = @($Names | ForEach-Object { $_ -split '[,;\s]+' } | Where-Object { $_ })
+  if ($selected.Count -eq 0) {
+    $selected = @($ProbeCatalog.Keys)
+  }
+  foreach ($name in $selected) {
+    if (-not $ProbeCatalog.Contains($name)) {
+      throw "Unknown probe '$name'. Known probes: $($ProbeCatalog.Keys -join ', ')"
+    }
+    $entry = $ProbeCatalog[$name]
+    $body = if ($entry.ContainsKey('Body')) { $entry.Body } else { $null }
+    [pscustomobject]@{ Name = $name; Url = $entry.Url; Status = $entry.Status; Body = $body; Reader = $entry.Reader }
+  }
+  foreach ($url in @($ExtraUrls | ForEach-Object { $_ -split '[,;\s]+' } | Where-Object { $_ })) {
+    [pscustomobject]@{ Name = ([uri] $url).Host; Url = $url; Status = 204; Body = $null; Reader = 'Read-StatusProbe' }
+  }
+}
+
+<#
+.SYNOPSIS
+  Formats an exit IP and, when it is one of the listed servers, that server's name.
+#>
+function Format-ExitIp {
+  param(
+    [string] $Address,
+    [string] $Suffix,
+    [hashtable] $Owners
+  )
+  $text = ("$Address $Suffix").Trim()
+  $canonical = ConvertTo-CanonicalIp $Address
+  if ($Owners.ContainsKey($canonical)) {
+    return "$text = $($Owners[$canonical])"
+  }
+  "$text (not a listed server)"
+}
+
+<#
+.SYNOPSIS
+  Reads a captive-portal probe: the status must match and, if set, the body pattern too.
+.OUTPUTS
+  Level and Text for the probe line.
+#>
+function Read-StatusProbe {
+  [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSReviewUnusedParameter', 'ExitIpOwners', Justification = 'All probe readers share one signature.')]
+  param(
+    [pscustomobject] $Probe,
+    [System.Net.Http.HttpResponseMessage] $Response,
+    [string] $Body,
+    [hashtable] $ExitIpOwners
+  )
+  $code = [int] $Response.StatusCode
+  if ($code -ne $Probe.Status) {
+    # A redirect is how most captive portals and DPI stub pages answer
+    $location = $Response.Headers.Location
+    $where = if ($location) { ", redirect to $location" } else { '' }
+    return @{ Level = 'Fail'; Text = Get-ShortText "HTTP $code, expected $($Probe.Status)$where" }
+  }
+  if (-not $Probe.Body) {
+    return @{ Level = 'Ok'; Text = "HTTP $code" }
+  }
+  $found = [regex]::Match($Body.Trim(), $Probe.Body, 'IgnoreCase')
+  if (-not $found.Success) {
+    return @{ Level = 'Fail'; Text = Get-ShortText "HTTP $code, unexpected text: $($Body.Trim())" }
+  }
+  @{ Level = 'Ok'; Text = Get-ShortText "HTTP $code `"$($found.Value)`"" }
+}
+
+<#
+.SYNOPSIS
+  Reads an exit IP service that answers with the bare address.
+.OUTPUTS
+  Level and Text for the probe line.
+#>
+function Read-ExitIpProbe {
+  param(
+    [pscustomobject] $Probe,
+    [System.Net.Http.HttpResponseMessage] $Response,
+    [string] $Body,
+    [hashtable] $ExitIpOwners
+  )
+  $code = [int] $Response.StatusCode
+  $address = $Body.Trim()
+  if ($code -ne $Probe.Status -or -not (Test-IpAddress $address)) {
+    return @{ Level = 'Fail'; Text = Get-ShortText "HTTP $code, no address: $address" }
+  }
+  @{ Level = 'Ok'; Text = Format-ExitIp -Address $address -Owners $ExitIpOwners }
+}
+
+<#
+.SYNOPSIS
+  Reads Cloudflare's /cdn-cgi/trace: key=value lines with ip= (exit IP) and loc= (country).
+.OUTPUTS
+  Level and Text for the probe line.
+#>
+function Read-TraceProbe {
+  param(
+    [pscustomobject] $Probe,
+    [System.Net.Http.HttpResponseMessage] $Response,
+    [string] $Body,
+    [hashtable] $ExitIpOwners
+  )
+  $code = [int] $Response.StatusCode
+  $fields = @{}
+  foreach ($line in $Body -split '\r?\n') {
+    if ($line -match '^(?<key>[a-z_]+)=(?<value>.*)$') {
+      $fields[$Matches.key] = $Matches.value.Trim()
+    }
+  }
+  if ($code -ne $Probe.Status -or -not $fields.ContainsKey('ip') -or -not (Test-IpAddress $fields.ip)) {
+    return @{ Level = 'Fail'; Text = "HTTP $code, no ip= line" }
+  }
+  $country = if ($fields.ContainsKey('loc')) { $fields.loc } else { '' }
+  @{ Level = 'Ok'; Text = Format-ExitIp -Address $fields.ip -Suffix $country -Owners $ExitIpOwners }
+}
+
+<#
+.SYNOPSIS
+  Turns a failed request into a short text: timeout, a socket error or the first line of the message.
+#>
+function Get-ProbeError {
+  param([System.Threading.Tasks.Task] $Task)
+  if ($Task.IsCanceled) {
+    return 'timeout'
+  }
+  $base = $Task.Exception.GetBaseException()
+  if ($base -is [System.Threading.Tasks.TaskCanceledException] -or $base -is [System.TimeoutException]) {
+    return 'timeout'
+  }
+  if ($base -is [System.Net.Sockets.SocketException]) {
+    return Get-ShortError $base
+  }
+  Get-ShortText $base.Message
+}
+
+<#
+.SYNOPSIS
+  Sends all probes at once and reads every answer with the probe's reader.
+.DESCRIPTION
+  Requests run in parallel through one HttpClient (no redirects followed), so a dead
+  network costs one timeout, not one per probe. The time of each probe is taken when
+  its request is seen finished (polled every 10 ms).
+.PARAMETER Probes
+  Objects from Get-ProbeList.
+.PARAMETER TimeoutSec
+  Timeout for each request.
+.PARAMETER ProxyUrl
+  Optional HTTP proxy; without it the system proxy settings apply.
+.PARAMETER ExitIpOwners
+  Canonical server IP -> server name, to name the server an exit IP belongs to.
+.OUTPUTS
+  Objects with Name, Time, Level and Text, in the order of -Probes.
+#>
+function Invoke-ConnectivityProbe {
+  param(
+    [object[]] $Probes,
+    [int] $TimeoutSec,
+    [string] $ProxyUrl,
+    [hashtable] $ExitIpOwners
+  )
+  Add-Type -AssemblyName System.Net.Http
+  # Windows PowerShell 5.1 may still default to TLS 1.0, which most of these hosts refuse
+  [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor [System.Net.SecurityProtocolType]::Tls12
+
+  $handler = [System.Net.Http.HttpClientHandler]::new()
+  $handler.AllowAutoRedirect = $false
   if ($ProxyUrl) {
-    $request.Proxy = $ProxyUrl
+    $handler.Proxy = [System.Net.WebProxy]::new($ProxyUrl)
+    $handler.UseProxy = $true
   }
+  $client = [System.Net.Http.HttpClient]::new($handler)
+  $client.Timeout = [TimeSpan]::FromSeconds($TimeoutSec)
+  $client.DefaultRequestHeaders.UserAgent.ParseAdd('check-proxy-servers/1.0')
 
-  $watch = [System.Diagnostics.Stopwatch]::StartNew()
   try {
-    $response = Invoke-WebRequest @request
-  } catch {
-    return New-Check 'Fail' $_.Exception.GetBaseException().Message
-  }
-  $watch.Stop()
+    $watch = [System.Diagnostics.Stopwatch]::StartNew()
+    $pending = @(foreach ($probe in $Probes) {
+        [pscustomobject]@{ Probe = $probe; Task = $client.GetAsync($probe.Url); ElapsedMs = -1 }
+      })
+    while (@($pending | Where-Object { $_.ElapsedMs -lt 0 }).Count -gt 0) {
+      foreach ($item in $pending) {
+        if ($item.ElapsedMs -lt 0 -and $item.Task.IsCompleted) {
+          $item.ElapsedMs = $watch.ElapsedMilliseconds
+        }
+      }
+      Start-Sleep -Milliseconds 10
+    }
 
-  $code = [int] $response.StatusCode
-  if ($code -ne 204) {
-    # Anything else usually means a captive portal, DPI stub page or a redirect
-    return New-Check 'Fail' "HTTP $code, expected 204"
+    foreach ($item in $pending) {
+      $line = [pscustomobject]@{ Name = $item.Probe.Name; Time = "$($item.ElapsedMs) ms"; Level = 'Fail'; Text = '' }
+      if ($item.Task.IsFaulted -or $item.Task.IsCanceled) {
+        $line.Text = Get-ProbeError $item.Task
+        $line
+        continue
+      }
+      $response = $item.Task.Result
+      try {
+        $body = $response.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+        $read = & $item.Probe.Reader -Probe $item.Probe -Response $response -Body $body -ExitIpOwners $ExitIpOwners
+      } finally {
+        $response.Dispose()
+      }
+      $line.Level = $read.Level
+      $line.Text = $read.Text
+      $line
+    }
+  } finally {
+    $client.Dispose()
   }
-  New-Check 'Ok' "HTTP 204 in $($watch.ElapsedMilliseconds) ms"
 }
 
 <#
@@ -792,6 +1021,13 @@ function Write-Row {
 $servers = @(Get-ServerList -Inline $Ip -FilePath $ListFile)
 if ($servers.Count -eq 0) {
   Write-Host 'Nothing to check: pass addresses and domains as arguments or use -ListFile.' -ForegroundColor Red
+  exit 2
+}
+
+try {
+  $probes = @(Get-ProbeList -Names $Probe -ExtraUrls $ProbeUrl -Skip:$NoProbe)
+} catch {
+  Write-Host $_.Exception.Message -ForegroundColor Red
   exit 2
 }
 
@@ -880,11 +1116,26 @@ if ($sawFakeIp) {
   Write-Host 'Yellow addresses are in 198.18.0.0/15, likely FakeIP from podkop/sing-box: try -DnsServer 1.1.1.1' -ForegroundColor Yellow
 }
 
-$route = if ($Proxy) { "via $Proxy" } else { 'default route' }
-$probe = Test-Generate204 -Url $ProbeUrl -TimeoutSec $HttpTimeoutSec -ProxyUrl $Proxy
-Write-Host ('generate_204 ({0}): {1}' -f $route, $probe.Text) -ForegroundColor $LevelColor[$probe.Level]
-$totalChecks++
-if ($probe.Level -eq 'Fail') { $failedChecks++ }
+if ($probes.Count -gt 0) {
+  $route = if ($Proxy) { "via $Proxy" } else { 'default route' }
+  Write-Host "Probes ($route)" -ForegroundColor White
+  $exitIpOwners = @{}
+  foreach ($server in $servers) {
+    foreach ($address in $server.Addresses) {
+      $exitIpOwners[(ConvertTo-CanonicalIp $address)] = $server.Name
+    }
+  }
+  $probeWidth = [int] ($probes | ForEach-Object { $_.Name.Length } | Measure-Object -Maximum).Maximum
+  foreach ($result in Invoke-ConnectivityProbe -Probes $probes -TimeoutSec $HttpTimeoutSec -ProxyUrl $Proxy -ExitIpOwners $exitIpOwners) {
+    $totalChecks++
+    if ($result.Level -eq 'Fail') { $failedChecks++ }
+    Write-Row @(
+      @{ Text = $result.Name; Width = $probeWidth; Color = 'Cyan' }
+      @{ Text = $result.Time; Width = 8; Color = 'DarkGray' }
+      @{ Text = $result.Text; Width = $result.Text.Length; Color = $LevelColor[$result.Level] }
+    )
+  }
+}
 
 if ($failedChecks -gt 0) {
   Write-Host "$failedChecks of $totalChecks checks failed" -ForegroundColor Red
