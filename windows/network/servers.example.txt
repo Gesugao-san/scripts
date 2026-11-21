@@ -1,10 +1,13 @@
 # Proxy servers for check-proxy-servers.ps1
-# [name] starts a server, the lines below hold its addresses; '#' starts a comment
+# [name] starts a server, the lines below hold its IP addresses and domain names;
+# every domain must resolve only to IP addresses of its own server. '#' starts a comment
 
 [de-hetzner]
 203.0.113.10
 203.0.113.11  # reserve IP
+de.example.com
+cdn.example.com
 
 [nl]
-198.51.100.7, 198.51.100.8
+198.51.100.7, 198.51.100.8, nl.example.net
 
