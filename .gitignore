@@ -126,3 +126,6 @@ $RECYCLE.BIN/
 channels.csv
 pairs.txt
 
+### windows/network/check-proxy-servers.ps1 ###
+# Real server list (IP addresses of own proxies)
+windows/network/servers.txt

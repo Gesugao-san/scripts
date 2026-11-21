@@ -1,0 +1,10 @@
+# Proxy servers for check-proxy-servers.ps1
+# [name] starts a server, the lines below hold its addresses; '#' starts a comment
+
+[de-hetzner]
+203.0.113.10
+203.0.113.11  # reserve IP
+
+[nl]
+198.51.100.7, 198.51.100.8
+
