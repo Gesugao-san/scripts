@@ -1,7 +1,7 @@
 #!/usr/bin/env pwsh
 <#
 .SYNOPSIS
-  Quick health check of proxy servers: ping, TCP ports, DNS records and connectivity probes.
+  Quick health check of proxy servers: ping, TCP ports, TLS, DNS records and connectivity probes.
 
 .DESCRIPTION
   Checks every address of every server and prints one colored table,
@@ -10,9 +10,16 @@
     - TCP <port>: TCP connect to every port from -Ports (22 and 443 by default).
       "refused" means the host is alive but nothing listens on the port;
       "timeout" means the host is down or the port is filtered.
+    - TLS <port>: TLS handshake like openssl s_client -connect ip:443 -servername name,
+      with SNI = -TlsServerName or else the server's first domain name; the certificate
+      chain and name are checked. "1.3 89d" is the TLS version and the days the
+      certificate is still valid (yellow below 14 days). Without a name no SNI is sent
+      and only the chain is checked. Turn it off with -NoTls.
   Then a row per domain name of the server: the domain is resolved (A and AAAA)
   and every returned address must be one of the server's IP addresses from the list.
     - DNS m/n: m of the n returned addresses belong to the server.
+    - TLS: the same TLS check with SNI = the domain, against the first returned address
+      of the server (or the first returned address at all).
     - Every returned address follows, green when it belongs to the server, red when not,
       yellow when it looks like FakeIP (198.18.0.0/15, e.g. from podkop/sing-box).
   Colors: green - OK, yellow - partial (some pings lost / some checks failed), red - failed.
@@ -57,6 +64,16 @@
 .PARAMETER PingCount
   Number of echo requests per address. Default: 4.
 
+.PARAMETER NoTls
+  Skip the TLS checks.
+
+.PARAMETER TlsPort
+  Port for the TLS checks. Default: 443.
+
+.PARAMETER TlsServerName
+  SNI for the TLS check of every IP address, e.g. the serverName of a VLESS Reality inbound.
+  Default: the first domain name of the server, or no SNI when it has none.
+
 .PARAMETER DnsServer
   DNS server for the domain checks. Default: the system's DNS servers (usually the router).
   Any resolver takes an IP address or host name; doggo also takes tcp://, tls://, https://
@@ -97,6 +114,9 @@
   .\check-proxy-servers.ps1 -ListFile .\servers.txt -DnsServer https://cloudflare-dns.com/dns-query
 
 .EXAMPLE
+  .\check-proxy-servers.ps1 reality=203.0.113.10 -TlsServerName www.microsoft.com
+
+.EXAMPLE
   .\check-proxy-servers.ps1 -ListFile .\servers.txt -PingCount 2 -TimeoutMs 1500 -Ports 22,443,8443
 
 .EXAMPLE
@@ -127,6 +147,13 @@ param(
 
   [ValidateRange(1, 100)]
   [int] $PingCount = 4,
+
+  [switch] $NoTls,
+
+  [ValidateRange(1, 65535)]
+  [int] $TlsPort = 443,
+
+  [string] $TlsServerName,
 
   [string] $DnsServer,
 
@@ -174,6 +201,27 @@ $SocketErrorText = @{
 
 # Width of every check column in the table
 $CellWidth = 11
+
+# TLS versions as SslStream reports them -> short text for the table
+# (12288 is TLS 1.3 on .NET Framework builds whose SslProtocols enum has no Tls13 name)
+$TlsVersionText = @{
+  Tls13   = '1.3'
+  '12288' = '1.3'
+  Tls12   = '1.2'
+  Tls11   = '1.1'
+  Tls     = '1.0'
+  Ssl3    = 'SSL3'
+}
+
+# Certificate problems in the order they are reported -> short text for the table
+$TlsErrorText = [ordered]@{
+  RemoteCertificateNotAvailable = 'no cert'
+  RemoteCertificateNameMismatch = 'wrong name'
+  RemoteCertificateChainErrors  = 'untrusted'
+}
+
+# Days of certificate validity left below which the TLS cell turns yellow
+$CertWarnDays = 14
 
 # Longest error text shown in a domain row
 $MaxErrorLength = 60
@@ -468,6 +516,106 @@ function Test-TcpPort {
     return New-Check 'Fail' 'timeout'
   }
   New-Check 'Ok' "$($watch.ElapsedMilliseconds)ms"
+}
+
+<#
+.SYNOPSIS
+  Turns a failed TLS connection or handshake into a short text for a table cell.
+#>
+function Get-TlsError {
+  param(
+    [System.Exception] $Exception,
+    [bool] $Connected
+  )
+  $base = $Exception.GetBaseException()
+  if (-not $Connected) {
+    # Failed before TLS started: the same texts as the TCP columns
+    return Get-ShortError $Exception
+  }
+  if ($base -is [System.Security.Authentication.AuthenticationException]) {
+    # Both sides talk TLS but could not agree (protocol versions, ciphers)
+    return 'handshake'
+  }
+  # The server closed the connection, reset it or stopped answering during the handshake:
+  # nothing that speaks TLS listens there, or DPI cut the connection
+  'no TLS'
+}
+
+<#
+.SYNOPSIS
+  Opens a TLS connection like openssl s_client -servername and checks the certificate.
+.DESCRIPTION
+  Connects to Target:Port, sends ServerName as SNI and validates the certificate chain
+  and, when a server name is given, the name in the certificate. Protocol versions are
+  left to the OS (SslProtocols.None), as curl and browsers do. Without ServerName no SNI
+  is sent and the name is not checked: the cell then only shows that TLS answers.
+.PARAMETER Target
+  IP address or host name to connect to.
+.PARAMETER Port
+  TCP port, usually 443.
+.PARAMETER ServerName
+  Name for SNI and for the certificate name check; empty for none.
+.PARAMETER Timeout
+  Timeout for the connect and for each read or write of the handshake, in milliseconds.
+.OUTPUTS
+  A check: "1.3 89d" (TLS version, days the certificate is still valid), yellow below
+  $CertWarnDays days; red with expired, wrong name, untrusted, no cert or a connection error.
+#>
+function Test-TlsHandshake {
+  param(
+    [string] $Target,
+    [int] $Port,
+    [string] $ServerName,
+    [int] $Timeout
+  )
+  # The validation callback only records what .NET found; the decision is made below
+  $state = @{ Errors = [System.Net.Security.SslPolicyErrors]::None }
+  $callback = [System.Net.Security.RemoteCertificateValidationCallback] {
+    # Arguments: sender, certificate, chain, policy errors
+    $state.Errors = $args[3]
+    $true
+  }.GetNewClosure()
+
+  $client = [System.Net.Sockets.TcpClient]::new()
+  $ssl = $null
+  $connected = $false
+  try {
+    if (-not $client.ConnectAsync($Target, $Port).Wait($Timeout)) {
+      return New-Check 'Fail' 'timeout'
+    }
+    $connected = $true
+    $client.ReceiveTimeout = $Timeout
+    $client.SendTimeout = $Timeout
+    $ssl = [System.Net.Security.SslStream]::new($client.GetStream(), $false, $callback)
+    $hostName = if ($ServerName) { $ServerName } else { $Target }
+    $ssl.AuthenticateAsClient($hostName, $null, [System.Security.Authentication.SslProtocols]::None, $false)
+
+    $certificate = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($ssl.RemoteCertificate)
+    $days = [int] [math]::Floor(($certificate.NotAfter - (Get-Date)).TotalDays)
+    $protocol = $ssl.SslProtocol.ToString()
+    $version = if ($TlsVersionText.ContainsKey($protocol)) { $TlsVersionText[$protocol] } else { $protocol }
+  } catch {
+    return New-Check 'Fail' (Get-TlsError -Exception $_.Exception -Connected $connected)
+  } finally {
+    if ($ssl) { $ssl.Dispose() }
+    $client.Dispose()
+  }
+
+  $errors = $state.Errors
+  if (-not $ServerName) {
+    # No SNI was sent, so the certificate is not expected to carry this name
+    $errors = $errors -band -bnot [System.Net.Security.SslPolicyErrors]::RemoteCertificateNameMismatch
+  }
+  if ($days -lt 0) {
+    return New-Check 'Fail' 'expired'
+  }
+  foreach ($flag in $TlsErrorText.Keys) {
+    if ($errors -band [System.Net.Security.SslPolicyErrors] $flag) {
+      return New-Check 'Fail' $TlsErrorText[$flag]
+    }
+  }
+  $level = if ($days -lt $CertWarnDays) { 'Warn' } else { 'Ok' }
+  New-Check $level "$version ${days}d"
 }
 
 <#
@@ -1053,6 +1201,9 @@ $entries = @($servers | ForEach-Object { @($_.Addresses) + @($_.Domains) })
 $nameWidth = [int] [math]::Max(6, ($servers | ForEach-Object { $_.Name.Length } | Measure-Object -Maximum).Maximum)
 $ipWidth = [int] [math]::Max(7, ($entries | ForEach-Object { $_.Length } | Measure-Object -Maximum).Maximum)
 $columns = @('Ping') + @($Ports | ForEach-Object { "TCP $_" })
+if (-not $NoTls) {
+  $columns += "TLS $TlsPort"
+}
 $lineWidth = $nameWidth + $ipWidth + $columns.Count * $CellWidth + ($columns.Count + 1) * 2
 $separator = '-' * $lineWidth
 
@@ -1072,6 +1223,10 @@ foreach ($server in $servers) {
   foreach ($address in $server.Addresses) {
     $checks = @(Test-Ping -Target $address -Count $PingCount -Timeout $TimeoutMs) +
       @(foreach ($port in $Ports) { Test-TcpPort -Target $address -Port $port -Timeout $TimeoutMs })
+    if (-not $NoTls) {
+      $sni = if ($TlsServerName) { $TlsServerName } else { $server.Domains | Select-Object -First 1 }
+      $checks += Test-TlsHandshake -Target $address -Port $TlsPort -ServerName $sni -Timeout $TimeoutMs
+    }
 
     $okCount = @($checks | Where-Object { $_.Level -eq 'Ok' }).Count
     $totalChecks += $checks.Count
@@ -1097,12 +1252,24 @@ foreach ($server in $servers) {
     if ($dns.Level -eq 'Fail') { $failedChecks++ }
     if (@($dns.Answers | Where-Object { Test-FakeIp $_.Address }).Count -gt 0) { $sawFakeIp = $true }
 
+    $tlsCells = @()
+    if (-not $NoTls) {
+      # Prefer an address of this server, so the check shows what the server itself presents
+      $own = @($dns.Answers | Where-Object { $_.Level -eq 'Ok' } | ForEach-Object { $_.Address })
+      $any = @($dns.Answers | ForEach-Object { $_.Address })
+      $target = @($own + $any + $domain)[0]
+      $tls = Test-TlsHandshake -Target $target -Port $TlsPort -ServerName $domain -Timeout $TimeoutMs
+      $totalChecks++
+      if ($tls.Level -eq 'Fail') { $failedChecks++ }
+      $tlsCells = @(@{ Text = "TLS $($tls.Text)"; Width = $CellWidth + 4; Color = $LevelColor[$tls.Level] })
+    }
+
     # Returned addresses and any error follow the DNS cell, each as wide as its text
     $row = @(
       @{ Text = $label; Width = $nameWidth; Color = 'Cyan' }
       @{ Text = $domain; Width = $ipWidth; Color = $LevelColor[$dns.Level] }
       @{ Text = $dns.Text; Width = $CellWidth; Color = $LevelColor[$dns.Level] }
-    ) + @($dns.Answers | ForEach-Object { @{ Text = $_.Address; Width = $_.Address.Length; Color = $LevelColor[$_.Level] } })
+    ) + $tlsCells + @($dns.Answers | ForEach-Object { @{ Text = $_.Address; Width = $_.Address.Length; Color = $LevelColor[$_.Level] } })
     if ($dns.Error) {
       $row += @{ Text = $dns.Error; Width = $dns.Error.Length; Color = $LevelColor[$dns.Level] }
     }
