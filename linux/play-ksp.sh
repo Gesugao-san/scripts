@@ -16,8 +16,19 @@
 #   for example /home/<user>/.local/bin/play-ksp (CKAN splits the line on spaces,
 #   so the path must not contain any).
 #
+# Second mode, the other way round: Steam's Play button opens CKAN.
+#   Steam -> KSP -> Properties -> Launch options:
+#     ~/.local/bin/play-ksp --from-steam %command%
+#   Steam then still starts its own reaper (which counts play time) and
+#   steam-launch-wrapper, but CKAN runs in place of the game, outside the
+#   Steam Linux Runtime and Proton. Steam counts the whole time CKAN is open.
+#   Inside CKAN, start the game with the native line (./KSP.x86_64), not with
+#   play-ksp: Steam already considers KSP running.
+#   The CKAN command is taken from $CKAN_CMD (default: ckan). Steam's full
+#   command line is logged to ~/.cache/play-ksp/steam-command.log.
+#
 # Exit codes: 0 - the game ran and exited; 1 - no way to reach Steam;
-#             2 - the game did not start in time.
+#             2 - the game did not start in time; 3 - CKAN not found.
 
 set -euo pipefail
 
@@ -87,7 +98,73 @@ wait_for_exit() {
   done
 }
 
+#######################################
+# Prints how many leading words of Steam's %command% to keep: the reaper and
+# steam-launch-wrapper with their "--" separators, without the runtime, Proton
+# or the game behind them. Prints 0 when there is nothing recognisable.
+# Arguments: Steam's %command%, word by word.
+#######################################
+steam_prefix_length() {
+  local -a words=("$@")
+  local i wrapper=-1 reaper_end=-1
+
+  for i in "${!words[@]}"; do
+    case "${words[i]}" in
+      */steam-launch-wrapper) wrapper=$i ;;
+      --) (( reaper_end < 0 )) && reaper_end=$i ;;
+    esac
+  done
+
+  # Keep up to the "--" right after steam-launch-wrapper.
+  if (( wrapper >= 0 )); then
+    for (( i = wrapper + 1; i < ${#words[@]}; i++ )); do
+      if [[ ${words[i]} == -- ]]; then
+        echo $(( i + 1 ))
+        return
+      fi
+    done
+  fi
+
+  # No launch wrapper: keep the reaper part only.
+  if (( reaper_end >= 0 )); then
+    echo $(( reaper_end + 1 ))
+    return
+  fi
+
+  echo 0
+}
+
+#######################################
+# Runs CKAN in place of the game inside Steam's launch chain.
+# Arguments: Steam's %command%, word by word.
+#######################################
+run_ckan_from_steam() {
+  local ckan=${CKAN_CMD:-ckan}
+  if ! command -v "$ckan" >/dev/null 2>&1; then
+    echo "play-ksp: CKAN command '$ckan' not found; set CKAN_CMD." >&2
+    exit 3
+  fi
+
+  local log_dir=${XDG_CACHE_HOME:-$HOME/.cache}/play-ksp
+  mkdir -p "$log_dir"
+  {
+    printf '%s' "$(date -Is)"
+    printf ' %q' "$@"
+    echo
+  } >>"$log_dir/steam-command.log"
+
+  local keep
+  keep=$(steam_prefix_length "$@")
+  # The Steam runtime's libraries must not leak into CKAN (Mono or .NET).
+  exec "${@:1:keep}" env -u LD_LIBRARY_PATH -u LD_PRELOAD "$(command -v "$ckan")"
+}
+
 main() {
+  if [[ ${1:-} == --from-steam ]]; then
+    shift
+    run_ckan_from_steam "$@"
+  fi
+
   start_through_steam || exit 1
   wait_for_start || exit 2
   wait_for_exit
